@@ -1,10 +1,12 @@
 """
 네이버 리뷰 크롤러 (Playwright 사용)
 네이버 플레이스/지도에서 리뷰를 자동으로 수집하는 프로그램입니다.
+
+사용자가 가게 이름이나 주소만 입력하면 자동으로 네이버 플레이스를 찾아서 크롤링합니다.
 """
 import asyncio
 from playwright.async_api import async_playwright
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 import re
 
 def clean_review_text(text: str) -> str:
@@ -95,6 +97,151 @@ def clean_review_text(text: str) -> str:
     review_text = re.sub(r'\s+', ' ', review_text)  # 다중 공백 제거
     
     return review_text.strip()
+
+
+async def search_place_and_get_url(query: str) -> Optional[Tuple[str, str]]:
+    """
+    네이버 지도에서 가게를 검색하여 자동으로 플레이스 URL과 가게명을 찾습니다.
+
+    사용자가 "바람난 얼큰 수제비 범계점" 또는 "서울 강남구 테헤란로 123" 같은
+    가게 이름이나 주소를 입력하면, 네이버 지도 검색을 통해 자동으로
+    해당 가게의 리뷰 페이지 URL을 찾아줍니다.
+
+    Args:
+        query: 검색할 가게 이름 또는 주소 (예: "바람난 얼큰 수제비 범계점")
+
+    Returns:
+        (리뷰 URL, 가게명) 튜플, 실패 시 None
+        예: ("https://m.place.naver.com/restaurant/31264425/review/visitor", "바람난 얼큰 수제비 범계점")
+    """
+    async with async_playwright() as p:
+        # 브라우저 실행 (headless=True는 화면 없이 백그라운드 실행)
+        browser = await p.chromium.launch(headless=True)
+
+        # 모바일 환경으로 설정 (모바일 페이지가 더 안정적)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+            viewport={"width": 375, "height": 812}
+        )
+
+        page = await context.new_page()
+
+        try:
+            # 네이버 지도 모바일 검색 페이지로 이동
+            search_url = f"https://m.map.naver.com/search2/search.naver?query={query}"
+            print(f"🔍 네이버 지도에서 '{query}' 검색 중...")
+
+            await page.goto(search_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(2000)  # 검색 결과 로딩 대기
+
+            # 1. 이미 플레이스 상세 페이지로 리다이렉트된 경우 체크
+            current_url = page.url
+            if "m.place.naver.com" in current_url and ("/restaurant/" in current_url or "/place/" in current_url):
+                print("✅ 검색 결과가 바로 상세 페이지로 연결되었습니다.")
+                place_href = current_url
+                store_name = query # 리다이렉트된 경우 정확한 이름을 알기 어려울 수 있음 (나중에 추출)
+            else:
+                # 2. 검색 결과 리스트에서 장소들 찾기
+                place_links = await page.locator('a[href*="/place/"], a[href*="/restaurant/"]').all()
+
+                if not place_links:
+                    print("❌ 검색 결과를 찾을 수 없습니다.")
+                    await browser.close()
+                    return None
+
+                # 검색 결과가 여러 개인 경우 사용자에게 선택 요청
+                if len(place_links) > 1:
+                    print(f"\n🤔 '{query}'에 대한 검색 결과가 {len(place_links)}개 발견되었습니다.")
+                    print("-" * 50)
+                    
+                    candidates = []
+                    for i, link in enumerate(place_links[:5]): # 최대 5개까지만 표시
+                        try:
+                            # 링크의 부모 요소 텍스트를 가져와서 정보 표시 (이름, 주소 등 포함됨)
+                            # 모바일 웹 구조상 텍스트가 흩어져 있을 수 있으므로, 부모의 텍스트를 통째로 가져옴
+                            parent = link.locator("..")
+                            info_text = await parent.inner_text()
+                            info_text = info_text.replace("\n", " ").strip()
+                            # 너무 길면 자르기
+                            if len(info_text) > 60:
+                                info_text = info_text[:57] + "..."
+                            
+                            candidates.append((link, info_text))
+                            print(f"[{i+1}] {info_text}")
+                        except:
+                            print(f"[{i+1}] (정보를 가져올 수 없음)")
+                            candidates.append((link, "정보 없음"))
+                    
+                    print("-" * 50)
+                    
+                    # 사용자 입력 대기 (CLI 환경 가정)
+                    try:
+                        selection = input("👉 분석할 가게 번호를 선택하세요 (기본값 1): ").strip()
+                        if not selection:
+                            selected_idx = 0
+                        else:
+                            selected_idx = int(selection) - 1
+                            if selected_idx < 0 or selected_idx >= len(candidates):
+                                print("⚠️ 잘못된 번호입니다. 1번을 선택합니다.")
+                                selected_idx = 0
+                    except Exception:
+                        # 입력 받을 수 없는 환경이면 1번 선택
+                        selected_idx = 0
+                    
+                    print(f"✅ {selected_idx + 1}번 가게를 선택했습니다.")
+                    first_link = candidates[selected_idx][0]
+                else:
+                    # 결과가 1개인 경우
+                    first_link = place_links[0]
+
+                place_href = await first_link.get_attribute('href')
+                
+                # 장소 상세 페이지로 이동
+                if place_href.startswith('/'):
+                    place_href = f"https://m.map.naver.com{place_href}"
+
+                print(f"📍 가게 페이지로 이동 중...")
+                await page.goto(place_href, wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(2000)
+
+            # 현재 URL에서 place ID 추출
+            current_url = page.url
+            place_id_match = re.search(r'/(?:restaurant|place)/(\d+)', current_url)
+
+            if not place_id_match:
+                print(f"❌ 플레이스 ID를 찾을 수 없습니다. URL: {current_url}")
+                await browser.close()
+                return None
+
+            place_id = place_id_match.group(1)
+
+            # 가게 이름 추출
+            try:
+                store_name_el = await page.locator('h1, .place_name, [class*="tit"]').first
+                if await store_name_el.count() > 0:
+                    store_name = await store_name_el.inner_text()
+                    store_name = store_name.strip()
+                elif 'store_name' not in locals():
+                    store_name = query
+            except:
+                if 'store_name' not in locals():
+                    store_name = query
+
+            # 리뷰 페이지 URL 생성
+            review_url = f"https://m.place.naver.com/restaurant/{place_id}/review/visitor"
+
+            print(f"✅ 가게 찾기 완료: {store_name}")
+            print(f"📍 리뷰 URL: {review_url}")
+
+            await browser.close()
+            return (review_url, store_name)
+
+        except Exception as e:
+            print(f"❌ 검색 중 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            await browser.close()
+            return None
 
 
 async def crawl_naver_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
@@ -262,17 +409,77 @@ async def crawl_naver_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
     return reviews[:max_reviews]
 
 
+async def crawl_by_search(query: str, max_reviews: int = 50) -> Tuple[List[Dict], Optional[str]]:
+    """
+    가게 이름/주소로 검색하여 자동으로 리뷰를 크롤링하는 올인원 함수
+
+    사용자 입장에서 가장 편리한 함수입니다. URL을 몰라도 가게 이름만 입력하면
+    자동으로 네이버 지도에서 검색하고 리뷰를 수집합니다.
+
+    Args:
+        query: 가게 이름 또는 주소 (예: "바람난 얼큰 수제비 범계점", "서울 강남구 테헤란로 123")
+        max_reviews: 수집할 최대 리뷰 개수 (기본값: 50개)
+
+    Returns:
+        (리뷰 리스트, 가게명) 튜플
+        - 리뷰 리스트: [{'text': ..., 'rating': ..., 'date': ..., 'source': 'naver'}, ...]
+        - 가게명: 자동으로 추출된 정확한 가게 이름
+
+    Example:
+        >>> reviews, store_name = await crawl_by_search("바람난 얼큰 수제비 범계점", max_reviews=30)
+        >>> print(f"{store_name}의 리뷰 {len(reviews)}개 수집 완료!")
+    """
+    print("=" * 60)
+    print("🔍 자동 검색 크롤링 시작")
+    print("=" * 60)
+
+    # 1단계: 네이버 지도에서 가게 검색
+    search_result = await search_place_and_get_url(query)
+
+    if not search_result:
+        print("❌ 가게를 찾을 수 없습니다. 검색어를 다시 확인해주세요.")
+        return ([], None)
+
+    review_url, store_name = search_result
+
+    # 2단계: 리뷰 크롤링
+    print(f"\n📥 리뷰 크롤링 시작...")
+    reviews = await crawl_naver_reviews(review_url, max_reviews=max_reviews)
+
+    print("=" * 60)
+    print(f"✅ 크롤링 완료: {store_name}")
+    print(f"📊 수집된 리뷰: {len(reviews)}개")
+    print("=" * 60)
+
+    return (reviews, store_name)
+
+
 # 이 파일을 직접 실행할 때만 작동하는 테스트 코드
 if __name__ == "__main__":
-    # 테스트용 URL 설정 (실제 네이버 플레이스 리뷰 페이지)
-    test_url = "https://m.place.naver.com/restaurant/31264425/review/visitor"
+    import sys
 
-    # 크롤링 실행 (최대 20개)
-    result = asyncio.run(crawl_naver_reviews(test_url, max_reviews=20))
+    # 사용자 입력 받기
+    if len(sys.argv) > 1:
+        # 명령줄 인자로 검색어 받기: python playwright_crawler.py "바람난 얼큰 수제비"
+        query = " ".join(sys.argv[1:])
+    else:
+        # 대화형으로 검색어 입력받기
+        query = input("\n🔍 검색할 가게 이름이나 주소를 입력하세요: ").strip()
+
+    if not query:
+        print("❌ 검색어를 입력하지 않았습니다.")
+        sys.exit(1)
+
+    # 자동 검색 크롤링 실행
+    reviews, store_name = asyncio.run(crawl_by_search(query, max_reviews=20))
+
+    if not reviews:
+        print("❌ 리뷰 수집에 실패했습니다.")
+        sys.exit(1)
 
     # 결과 출력 (처음 5개만 미리보기)
-    print(f"\n=== 수집 결과 ===")
-    for i, review in enumerate(result[:5], 1):
+    print(f"\n=== 수집 결과 ({store_name}) ===")
+    for i, review in enumerate(reviews[:5], 1):
         print(f"\n[리뷰 {i}]")
         print(f"내용: {review.get('text', 'N/A')[:100]}...")
         print(f"평점: {review.get('rating', 'N/A')}")

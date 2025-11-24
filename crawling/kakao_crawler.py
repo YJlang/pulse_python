@@ -141,6 +141,93 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
     
     return reviews[:max_reviews]
 
+async def search_place_and_get_url(query: str) -> str:
+    """
+    카카오맵에서 가게를 검색하고 URL을 반환합니다.
+    여러 결과가 있을 경우 사용자에게 선택을 요청합니다.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False) # 검색 과정은 보여줌
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+            viewport={"width": 375, "height": 812}
+        )
+        page = await context.new_page()
+        
+        try:
+            # 카카오맵 모바일 검색
+            search_url = f"https://m.map.kakao.com/actions/searchView?q={query}"
+            print(f"🔍 카카오맵에서 '{query}' 검색 중...")
+            
+            await page.goto(search_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(2000)
+            
+            # 검색 결과 찾기 (li[data-id])
+            result_items = await page.locator('li[data-id]').all()
+            
+            if not result_items:
+                # 결과가 없는 경우
+                print("❌ 카카오맵 검색 결과를 찾을 수 없습니다.")
+                return None
+            
+            selected_id = None
+            
+            if len(result_items) > 1:
+                print(f"\n🤔 카카오맵: '{query}'에 대한 검색 결과가 {len(result_items)}개 발견되었습니다.")
+                print("-" * 50)
+                
+                candidates = []
+                for i, item in enumerate(result_items[:5]):
+                    try:
+                        data_id = await item.get_attribute("data-id")
+                        text = await item.inner_text()
+                        text = text.replace("\n", " ").strip()
+                        if len(text) > 60:
+                            text = text[:57] + "..."
+                        
+                        candidates.append((data_id, text))
+                        print(f"[{i+1}] {text}")
+                    except:
+                        print(f"[{i+1}] (정보를 가져올 수 없음)")
+                        candidates.append((None, "정보 없음"))
+                
+                print("-" * 50)
+                
+                # 사용자 입력 대기
+                try:
+                    selection = input("👉 카카오맵 분석할 가게 번호를 선택하세요 (기본값 1): ").strip()
+                    if not selection:
+                        selected_idx = 0
+                    else:
+                        selected_idx = int(selection) - 1
+                        if selected_idx < 0 or selected_idx >= len(candidates):
+                            print("⚠️ 잘못된 번호입니다. 1번을 선택합니다.")
+                            selected_idx = 0
+                except:
+                    selected_idx = 0
+                
+                print(f"✅ {selected_idx + 1}번 가게를 선택했습니다.")
+                selected_id = candidates[selected_idx][0]
+            else:
+                # 결과가 1개인 경우
+                selected_id = await result_items[0].get_attribute("data-id")
+            
+            if selected_id:
+                # URL 생성 (리뷰 탭으로 바로 이동)
+                # https://place.map.kakao.com/{id}#review
+                final_url = f"https://place.map.kakao.com/{selected_id}#review"
+                print(f"✅ 카카오맵 가게 찾기 완료: ID {selected_id}")
+                print(f"📍 URL: {final_url}")
+                return final_url
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"❌ 카카오맵 검색 중 오류 발생: {e}")
+            return None
+        finally:
+            await browser.close()
+
 if __name__ == "__main__":
     # 테스트
     test_url = "https://place.map.kakao.com/1799462452#review"  # 실제 URL로 교체

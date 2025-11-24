@@ -1,53 +1,94 @@
 """
 통합 파이프라인: 멀티플랫폼 크롤링 (네이버 + 카카오) → BERTopic 분석 → LLM 페르소나 생성
+
+사용자가 가게 이름이나 주소만 입력하면 자동으로 검색하여 리뷰를 수집합니다.
+네이버와 카카오맵 모두 검색 결과가 여러 개일 경우 인터랙티브하게 선택할 수 있습니다.
 """
 import asyncio
 import json
-from crawling.playwright_crawler import crawl_naver_reviews
-from crawling.kakao_crawler import crawl_kakao_reviews
+import sys
+
+# 사용자 입력을 먼저 받기 (라이브러리 로딩 전)
+print("=" * 60)
+print("🏪 온라인 리뷰 분석 파이프라인 (네이버 + 카카오)")
+print("=" * 60)
+
+query = input("\n🔍 분석할 가게 이름이나 주소를 입력하세요: ").strip()
+
+if not query:
+    print("❌ 검색어를 입력하지 않았습니다.")
+    sys.exit(1)
+
+# 사용자 입력 받은 후에 라이브러리 로딩 시작
+print("\n⏳ 분석 라이브러리 로딩 중... (최초 실행 시 1-2분 소요)")
+print("   Tip: 다음 실행부터는 훨씬 빠릅니다!")
+
+from crawling.playwright_crawler import crawl_by_search, crawl_naver_reviews, search_place_and_get_url as search_naver
+from crawling.kakao_crawler import crawl_kakao_reviews, search_place_and_get_url as search_kakao
 from analysis.topic_model import run_topic_model
 from llm.persona_generator import generate_persona_with_ratings
 
+print("✅ 라이브러리 로딩 완료!\n")
+
+
 async def main():
-    naver_url = "https://m.place.naver.com/restaurant/31264425/review/visitor"
-    kakao_url = "https://place.map.kakao.com/1799462452#review"  # 카카오맵 URL 설정
-    
-    # 1단계: 네이버 방문자 리뷰 크롤링
+    # 1단계: 네이버 검색 및 크롤링
     print("=" * 60)
-    print("📥 Step 1-1: 네이버 방문자 리뷰 크롤링")
+    print("📥 Step 1: 네이버(Naver) 검색 및 크롤링")
     print("=" * 60)
-    naver_reviews = await crawl_naver_reviews(naver_url, max_reviews=50)
-    print(f"\n✅ {len(naver_reviews)}개 네이버 리뷰 수집\n")
     
-    # 1단계-2: 카카오맵 리뷰 크롤링 (선택)
-    kakao_reviews = []
+    naver_url = None
+    store_name = query # 기본값
+    
+    # 네이버 검색 (인터랙티브 선택 포함)
+    search_result = await search_naver(query)
+    if search_result:
+        naver_url, found_name = search_result
+        store_name = found_name # 네이버에서 찾은 이름으로 업데이트
+        
+        # 네이버 리뷰 크롤링
+        print(f"\n🚀 네이버 리뷰 수집 시작: {store_name}")
+        naver_reviews = await crawl_naver_reviews(naver_url, max_reviews=50)
+        print(f"✅ {len(naver_reviews)}개 네이버 리뷰 수집 완료")
+    else:
+        print("⚠️ 네이버에서 가게를 찾지 못했습니다.")
+        naver_reviews = []
+
+    # 2단계: 카카오맵 검색 및 크롤링
+    print("\n" + "=" * 60)
+    print("📥 Step 2: 카카오맵(Kakao) 검색 및 크롤링")
+    print("=" * 60)
+    
+    kakao_url = await search_kakao(query)
+    
     if kakao_url:
-        print("=" * 60)
-        print("📍 Step 1-2: 카카오맵 리뷰 크롤링")
-        print("=" * 60)
+        # 카카오 리뷰 크롤링
+        print(f"\n🚀 카카오맵 리뷰 수집 시작")
         kakao_reviews = await crawl_kakao_reviews(kakao_url, max_reviews=50)
-        print(f"\n✅ {len(kakao_reviews)}개 카카오 리뷰 수집\n")
-    
+        print(f"✅ {len(kakao_reviews)}개 카카오 리뷰 수집 완료")
+    else:
+        print("⚠️ 카카오맵에서 가게를 찾지 못했습니다.")
+        kakao_reviews = []
+
     # 리뷰 통합
     all_reviews = naver_reviews + kakao_reviews
-    print(f"📊 총 {len(all_reviews)}개 리뷰 (네이버: {len(naver_reviews)}, 카카오: {len(kakao_reviews)})\n")
+    print(f"\n📊 총 {len(all_reviews)}개 리뷰 (네이버: {len(naver_reviews)}, 카카오: {len(kakao_reviews)})\n")
     
     if not all_reviews:
-        print("❌ 리뷰가 없습니다. 종료합니다.")
+        print("❌ 수집된 리뷰가 없습니다. 프로그램을 종료합니다.")
         return
-    
-    # 2단계: BERTopic 토픽 분석 (cleaned text 사용)
+
+    # 3단계: BERTopic 토픽 분석
     print("=" * 60)
-    print("🤖 Step 2: BERTopic 토픽 분석 (CUDA)")
+    print("🤖 Step 3: BERTopic 토픽 분석")
     print("=" * 60)
     result = run_topic_model(all_reviews, n_topics=5, output_dir="./output")
-    
-    # 3단계: LLM 토픽별 페르소나 생성 (GPT o1 모델 사용)
+
+    # 4단계: LLM 토픽별 페르소나 생성
     print("\n" + "=" * 60)
-    print("🧠 Step 3: 토픽별 페르소나 생성 (GPT o1)")
+    print("🧠 Step 4: 토픽별 페르소나 생성 (GPT o1)")
     print("=" * 60)
 
-    # 토픽 정보가 추가된 리뷰 사용
     reviews_with_topics = result.get('reviews_with_topics', all_reviews)
 
     persona_result = generate_persona_with_ratings(
@@ -55,7 +96,7 @@ async def main():
         topics=result['topics'],
         topic_counts=result['topic_counts'],
         total_docs=result['docs_count'],
-        store_name="바람난 얼큰 수제비 범계점"
+        store_name=store_name
     )
 
     # 페르소나 저장
@@ -75,17 +116,17 @@ async def main():
         print(f"       ⭐ 평점: {p['avg_rating']}/5.0")
         print(f"       🔑 키워드: {', '.join(p['keywords'][:3])}")
         print(f"       👤 특성: {p['persona']['characteristics'][:50]}...")
-    
-    # 4단계: 결과 출력
+
+    # 5단계: 결과 출력
     print("\n" + "=" * 60)
-    print("📊 Step 4: 분석 결과 요약")
+    print("📊 Step 5: 분석 결과 요약")
     print("=" * 60)
-    
+
     if "error" not in result:
         print(f"\n📈 전체 문서 수: {result['docs_count']}")
         print(f"📈 아웃라이어: {result['outliers_count']}")
         print(f"📑 토픽 수: {len(result['topics'])}\n")
-        
+
         print("🔑 토픽별 키워드:")
         print("-" * 60)
         for topic_id in sorted(result['topics'].keys()):
@@ -93,13 +134,13 @@ async def main():
             count = result['topic_counts'][topic_id]
             pct = count / result['docs_count'] * 100
             print(f"  🏷️  Topic {topic_id} ({count}개, {pct:.1f}%): {', '.join(keywords)}")
-    
+
     print("\n📁 생성된 파일:")
     print("-" * 60)
     print(f"  ✅ {result['files'].get('summary', 'N/A')}")
     print(f"  ✅ {result['files'].get('details', 'N/A')}")
     print(f"  ✅ ./output/persona.json")
-    
+
     print("\n" + "=" * 60)
     print("✅ 전체 파이프라인 완료!")
     print("=" * 60)
