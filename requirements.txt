@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+playwright
+bertopic
+kiwipiepy
+openai
+python-dotenv
+pandas
+numpy
+scikit-learn
+pymongo

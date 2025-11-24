@@ -1,0 +1,67 @@
+# 환경 변수 파일 (민감 정보 포함)
+.env
+.env.local
+.env.*.local
+
+# 가상환경 디렉토리
+.venv/
+venv/
+ENV/
+env/
+
+# Python 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 분석 결과 파일 (output 디렉토리)
+output/
+*.csv
+*.json
+
+# 디버그 파일
+*.log
+*.png
+*.jpg
+*.jpeg
+*.html
+
+# IDE 설정 파일
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 관련 파일
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 테스트 커버리지
+.coverage
+htmlcov/
+.pytest_cache/
+
+# 빌드 결과물
+dist/
+build/
+*.egg-info/
+
+# MyPy 타입 체크
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Playwright 브라우저 파일
+.playwright/
+
+# 임시 파일
+*.tmp
+*.bak
+*.swp
