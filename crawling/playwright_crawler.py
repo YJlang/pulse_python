@@ -139,62 +139,133 @@ async def search_place_and_get_url(query: str) -> Optional[Tuple[str, str]]:
             if "m.place.naver.com" in current_url and ("/restaurant/" in current_url or "/place/" in current_url):
                 print("✅ 검색 결과가 바로 상세 페이지로 연결되었습니다.")
                 place_href = current_url
-                store_name = query # 리다이렉트된 경우 정확한 이름을 알기 어려울 수 있음 (나중에 추출)
+                store_name = query 
             else:
-                # 2. 검색 결과 리스트에서 장소들 찾기
-                place_links = await page.locator('a[href*="/place/"], a[href*="/restaurant/"]').all()
+                # 2. 검색 결과 리스트에서 장소들 찾기 (중복 제거 로직 추가)
+                # 검색 결과 아이템 컨테이너를 먼저 찾음
+                # 보통 li 태그 안에 _item_common_... 클래스 등을 가짐
+                # 하지만 모바일 웹 구조가 복잡하므로, a 태그를 찾되 부모를 확인하여 중복 제거
+                
+                raw_links = await page.locator('a[href*="/place/"], a[href*="/restaurant/"]').all()
+                
+                unique_places = []
+                seen_ids = set()
+                
+                for link in raw_links:
+                    href = await link.get_attribute('href')
+                    # ID 추출
+                    id_match = re.search(r'/(?:restaurant|place)/(\d+)', href)
+                    if not id_match:
+                        continue
+                        
+                    place_id = id_match.group(1)
+                    if place_id in seen_ids:
+                        continue
+                        
+                    # 새로운 장소 발견
+                    seen_ids.add(place_id)
+                    
+                    # 텍스트 추출 (부모 요소에서)
+                    try:
+                        # 링크의 텍스트가 비어있을 수 있음 (이미지 링크 등)
+                        # 따라서 부모 요소의 텍스트를 가져오거나, 링크 자체의 텍스트를 확인
+                        text = await link.inner_text()
+                        if not text.strip():
+                            # 텍스트가 없으면 부모나 형제 요소에서 찾기 시도
+                            # 여기서는 간단히 부모 텍스트 사용
+                            parent = link.locator("..")
+                            text = await parent.inner_text()
+                        
+                        text = text.replace("\n", " ").strip()
+                        # 너무 짧거나 이상한 텍스트 필터링 (예: "주소보기", "공유" 등)
+                        if len(text) < 2 or text in ["주소보기", "공유", "지도보기"]:
+                            # 상위 부모에서 다시 시도
+                            grandparent = link.locator("../..")
+                            text = await grandparent.inner_text()
+                            text = text.replace("\n", " ").strip()
+                            
+                        unique_places.append((link, text, href))
+                    except:
+                        continue
+                        
+                    if len(unique_places) >= 10: # 최대 10개까지만 수집
+                        break
 
-                if not place_links:
+                if not unique_places:
                     print("❌ 검색 결과를 찾을 수 없습니다.")
                     await browser.close()
                     return None
 
+                # 검색 결과 필터링 (정확도 향상)
+                filtered_places = []
+                exact_matches = []
+                
+                # 쿼리 정규화 (공백 제거)
+                normalized_query = query.replace(" ", "")
+                
+                for link, text, href in unique_places:
+                    # 텍스트에서 가게 이름만 추출 시도 (첫 번째 줄 or 공백 전까지)
+                    # 예: "이모네정육식당 정육식당..." -> "이모네정육식당"
+                    # 예: "이모네 한식..." -> "이모네"
+                    
+                    # 1. 줄바꿈으로 분리하여 첫 줄 확인
+                    first_line = text.split('\n')[0].strip()
+                    
+                    # 2. 이름 정규화
+                    normalized_name = first_line.replace(" ", "")
+                    
+                    # 정확히 일치하는 경우 (이모네 == 이모네)
+                    if normalized_name == normalized_query:
+                        exact_matches.append((link, text, href))
+                        continue
+                        
+                    # 쿼리가 이름에 포함되는 경우 (이모네김밥, 이모네식당)
+                    if normalized_query in normalized_name:
+                        filtered_places.append((link, text, href))
+                
+                # 정확히 일치하는 결과가 있으면 그것만 보여줌 (사용자 요청 반영)
+                if exact_matches:
+                    print(f"✨ '{query}'와 정확히 일치하는 가게를 우선 표시합니다.")
+                    final_places = exact_matches
+                else:
+                    final_places = filtered_places
+
+                if not final_places:
+                    # 필터링 결과가 없으면 원본 사용 (혹시 모를 오류 방지)
+                    final_places = unique_places
+
                 # 검색 결과가 여러 개인 경우 사용자에게 선택 요청
-                if len(place_links) > 1:
-                    print(f"\n🤔 '{query}'에 대한 검색 결과가 {len(place_links)}개 발견되었습니다.")
+                if len(final_places) > 1:
+                    print(f"\n🤔 '{query}'에 대한 검색 결과가 {len(final_places)}개 발견되었습니다.")
                     print("-" * 50)
                     
-                    candidates = []
-                    for i, link in enumerate(place_links[:5]): # 최대 5개까지만 표시
-                        try:
-                            # 링크의 부모 요소 텍스트를 가져와서 정보 표시 (이름, 주소 등 포함됨)
-                            # 모바일 웹 구조상 텍스트가 흩어져 있을 수 있으므로, 부모의 텍스트를 통째로 가져옴
-                            parent = link.locator("..")
-                            info_text = await parent.inner_text()
-                            info_text = info_text.replace("\n", " ").strip()
-                            # 너무 길면 자르기
-                            if len(info_text) > 60:
-                                info_text = info_text[:57] + "..."
-                            
-                            candidates.append((link, info_text))
-                            print(f"[{i+1}] {info_text}")
-                        except:
-                            print(f"[{i+1}] (정보를 가져올 수 없음)")
-                            candidates.append((link, "정보 없음"))
+                    for i, (link, text, href) in enumerate(final_places):
+                        # 텍스트 정리 (너무 길면 자르기)
+                        display_text = text
+                        if len(display_text) > 60:
+                            display_text = display_text[:57] + "..."
+                        print(f"[{i+1}] {display_text}")
                     
                     print("-" * 50)
                     
-                    # 사용자 입력 대기 (CLI 환경 가정)
+                    # 사용자 입력 대기
                     try:
                         selection = input("👉 분석할 가게 번호를 선택하세요 (기본값 1): ").strip()
                         if not selection:
                             selected_idx = 0
                         else:
                             selected_idx = int(selection) - 1
-                            if selected_idx < 0 or selected_idx >= len(candidates):
+                            if selected_idx < 0 or selected_idx >= len(final_places):
                                 print("⚠️ 잘못된 번호입니다. 1번을 선택합니다.")
                                 selected_idx = 0
                     except Exception:
-                        # 입력 받을 수 없는 환경이면 1번 선택
                         selected_idx = 0
                     
                     print(f"✅ {selected_idx + 1}번 가게를 선택했습니다.")
-                    first_link = candidates[selected_idx][0]
+                    place_href = final_places[selected_idx][2]
                 else:
                     # 결과가 1개인 경우
-                    first_link = place_links[0]
-
-                place_href = await first_link.get_attribute('href')
+                    place_href = final_places[0][2]
                 
                 # 장소 상세 페이지로 이동
                 if place_href.startswith('/'):

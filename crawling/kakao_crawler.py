@@ -9,13 +9,6 @@ import re
 async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
     """
     카카오맵 리뷰를 크롤링합니다 (별점 포함).
-    
-    Args:
-        url: 카카오맵 Place URL (예: https://place.map.kakao.com/...)
-        max_reviews: 수집할 최대 리뷰 개수
-        
-    Returns:
-        리뷰 리스트 [{'text': cleaned, 'raw_text': original, 'rating': int, 'source': 'kakao', 'date': str}]
     """
     reviews = []
     
@@ -32,6 +25,13 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
             await page.goto(url, wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(3000)
             
+            # 리뷰 탭이 활성화되어 있는지 확인 (URL에 #review가 있어도 가끔 안 될 때가 있음)
+            # 리뷰 리스트가 로딩될 때까지 대기
+            try:
+                await page.wait_for_selector("ul.list_review > li", timeout=5000)
+            except:
+                print("⚠️ 리뷰 리스트를 바로 찾지 못했습니다. 스크롤을 시도합니다.")
+            
             scroll_attempts = 0
             max_scroll_attempts = 15
             prev_count = 0
@@ -40,7 +40,7 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
                 # 카카오맵 리뷰 요소 찾기 (ul.list_review > li)
                 review_elements = await page.locator("ul.list_review > li").all()
                 
-                print(f"   Found {len(review_elements)} review elements...")
+                # print(f"   Found {len(review_elements)} review elements...")
                 
                 temp_reviews = []
                 for i, el in enumerate(review_elements):
@@ -108,7 +108,7 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
                         unique_texts.add(r['raw_text'])
                 
                 current_count = len(reviews)
-                print(f"   📊 Collected {current_count} Kakao reviews (attempt {scroll_attempts + 1})...")
+                # print(f"   📊 Collected {current_count} Kakao reviews (attempt {scroll_attempts + 1})...")
                 
                 if current_count == prev_count:
                     scroll_attempts += 1
@@ -118,9 +118,9 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
                 
                 # 스크롤
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1500)
                 
-                # 더보기 버튼 (페이지 하단) 처리 - 카카오맵은 스크롤만으로 로딩되는 경우가 많지만, "후기 더보기" 버튼이 있을 수도 있음
+                # 더보기 버튼 (페이지 하단) 처리
                 try:
                     more_reviews_btn = await page.locator("a.link_more:has-text('후기 더보기')").first
                     if await more_reviews_btn.count() > 0 and await more_reviews_btn.is_visible():
@@ -133,8 +133,6 @@ async def crawl_kakao_reviews(url: str, max_reviews: int = 50) -> List[Dict]:
         
         except Exception as e:
             print(f"❌ Error during Kakao crawling: {e}")
-            import traceback
-            traceback.print_exc()
         
         finally:
             await browser.close()
@@ -147,7 +145,7 @@ async def search_place_and_get_url(query: str) -> str:
     여러 결과가 있을 경우 사용자에게 선택을 요청합니다.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False) # 검색 과정은 보여줌
+        browser = await p.chromium.launch(headless=True) # 사용자 요청으로 헤드리스 모드 전환
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
             viewport={"width": 375, "height": 812}
@@ -163,33 +161,74 @@ async def search_place_and_get_url(query: str) -> str:
             await page.wait_for_timeout(2000)
             
             # 검색 결과 찾기 (li[data-id])
+            # 중복 제거를 위해 data-id를 기준으로 수집
             result_items = await page.locator('li[data-id]').all()
             
             if not result_items:
-                # 결과가 없는 경우
                 print("❌ 카카오맵 검색 결과를 찾을 수 없습니다.")
                 return None
             
+            unique_candidates = []
+            seen_ids = set()
+            
+            for item in result_items:
+                try:
+                    data_id = await item.get_attribute("data-id")
+                    if not data_id or data_id in seen_ids:
+                        continue
+                    
+                    seen_ids.add(data_id)
+                    
+                    # 텍스트 추출 (이름 + 주소 등)
+                    text = await item.inner_text()
+                    text = text.replace("\n", " ").strip()
+                    if len(text) > 60:
+                        text = text[:57] + "..."
+                    
+                    unique_candidates.append((data_id, text))
+                    
+                    if len(unique_candidates) >= 10: # 최대 10개까지만 수집
+                        break
+                except:
+                    continue
+            
+            # 검색 결과 필터링 (정확도 향상)
+            filtered_candidates = []
+            exact_matches = []
+            
+            normalized_query = query.replace(" ", "")
+            
+            for data_id, text in unique_candidates:
+                # 텍스트에서 가게 이름만 추출 시도 (첫 번째 줄 or 공백 전까지)
+                first_line = text.split('\n')[0].strip()
+                normalized_name = first_line.replace(" ", "")
+                
+                # 정확히 일치하는 경우
+                if normalized_name == normalized_query:
+                    exact_matches.append((data_id, text))
+                    continue
+                    
+                # 쿼리가 이름에 포함되는 경우
+                if normalized_query in normalized_name:
+                    filtered_candidates.append((data_id, text))
+            
+            if exact_matches:
+                print(f"✨ '{query}'와 정확히 일치하는 가게를 우선 표시합니다.")
+                final_candidates = exact_matches
+            else:
+                final_candidates = filtered_candidates
+            
+            if not final_candidates:
+                final_candidates = unique_candidates
+            
             selected_id = None
             
-            if len(result_items) > 1:
-                print(f"\n🤔 카카오맵: '{query}'에 대한 검색 결과가 {len(result_items)}개 발견되었습니다.")
+            if len(final_candidates) > 1:
+                print(f"\n🤔 카카오맵: '{query}'에 대한 검색 결과가 {len(final_candidates)}개 발견되었습니다.")
                 print("-" * 50)
                 
-                candidates = []
-                for i, item in enumerate(result_items[:5]):
-                    try:
-                        data_id = await item.get_attribute("data-id")
-                        text = await item.inner_text()
-                        text = text.replace("\n", " ").strip()
-                        if len(text) > 60:
-                            text = text[:57] + "..."
-                        
-                        candidates.append((data_id, text))
-                        print(f"[{i+1}] {text}")
-                    except:
-                        print(f"[{i+1}] (정보를 가져올 수 없음)")
-                        candidates.append((None, "정보 없음"))
+                for i, (data_id, text) in enumerate(final_candidates):
+                    print(f"[{i+1}] {text}")
                 
                 print("-" * 50)
                 
@@ -200,17 +239,20 @@ async def search_place_and_get_url(query: str) -> str:
                         selected_idx = 0
                     else:
                         selected_idx = int(selection) - 1
-                        if selected_idx < 0 or selected_idx >= len(candidates):
+                        if selected_idx < 0 or selected_idx >= len(final_candidates):
                             print("⚠️ 잘못된 번호입니다. 1번을 선택합니다.")
                             selected_idx = 0
                 except:
                     selected_idx = 0
                 
                 print(f"✅ {selected_idx + 1}번 가게를 선택했습니다.")
-                selected_id = candidates[selected_idx][0]
-            else:
+                selected_id = final_candidates[selected_idx][0]
+            elif len(final_candidates) == 1:
                 # 결과가 1개인 경우
-                selected_id = await result_items[0].get_attribute("data-id")
+                selected_id = final_candidates[0][0]
+            else:
+                print("❌ 유효한 검색 결과가 없습니다.")
+                return None
             
             if selected_id:
                 # URL 생성 (리뷰 탭으로 바로 이동)
