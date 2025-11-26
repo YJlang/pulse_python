@@ -86,7 +86,7 @@ async def main():
 
     # 4단계: LLM 토픽별 페르소나 생성
     print("\n" + "=" * 60)
-    print("🧠 Step 4: 토픽별 페르소나 생성 (GPT o1)")
+    print("🧠 Step 4: 토픽별 페르소나 생성 (Solar Pro2)")
     print("=" * 60)
 
     reviews_with_topics = result.get('reviews_with_topics', all_reviews)
