@@ -70,6 +70,12 @@ def generate_personas_by_topic(
                         'preferences': str,
                         'goals': str,
                         'pain_points': str
+                    },
+                    'customer_journey_map': {
+                        'awareness': str,
+                        'consideration': str,
+                        'visit': str,
+                        'post_visit': str
                     }
                 }
             ]
@@ -112,7 +118,8 @@ def generate_personas_by_topic(
             'percentage': percentage,
             'review_count': count,
             'avg_rating': topic_avg_rating,
-            'persona': persona_data['persona']
+            'persona': persona_data['persona'],
+            'customer_journey_map': persona_data.get('customer_journey_map', {})
         })
 
         print(f"   ✅ Topic {topic_id}: {persona_data['topic_name']} ({percentage}%)")
@@ -203,7 +210,8 @@ def _generate_single_persona(
     Returns:
         {
             'topic_name': str,  # 토픽 이름
-            'persona': {...}
+            'persona': {...},
+            'customer_journey_map': {...}
         }
     """
     # 리뷰 샘플 (최대 20개로 증가, 더 풍부한 컨텍스트)
@@ -265,6 +273,12 @@ def _generate_single_persona(
       - 개선이 필요한 부분
       - 잠재적 이탈 위험 요소
 
+3. **customer_journey_map**: 이 페르소나의 고객 여정 지도 (각 단계별로 구체적인 행동과 감정 서술)
+   - **Awareness** (인지): 가게를 알게 된 경로 (SNS, 지인 추천, 검색 등)
+   - **Consideration** (고려): 방문을 결심하게 된 결정적 요인 (메뉴 사진, 리뷰, 위치 등)
+   - **Visit** (방문/경험): 실제 매장에서의 경험 (대기, 주문, 식사, 분위기 등)
+   - **Post-Visit** (방문 후): 방문 후 행동 (재방문 의사, 리뷰 작성, 지인 추천 등)
+
 **중요**: 실제 리뷰 내용을 바탕으로 구체적이고 실용적인 인사이트를 제공하세요. 일반적인 내용보다는 이 가게와 고객 그룹만의 특징이 드러나야 합니다.
 
 **출력 형식** (반드시 JSON만 출력):
@@ -275,6 +289,12 @@ def _generate_single_persona(
     "preferences": "...",
     "goals": "...",
     "pain_points": "..."
+  }},
+  "customer_journey_map": {{
+    "awareness": "...",
+    "consideration": "...",
+    "visit": "...",
+    "post_visit": "..."
   }}
 }}
 """
@@ -320,6 +340,12 @@ def _generate_single_persona(
                 "preferences": "분석 실패",
                 "goals": "분석 실패",
                 "pain_points": "분석 실패"
+            },
+            "customer_journey_map": {
+                "awareness": "분석 실패",
+                "consideration": "분석 실패",
+                "visit": "분석 실패",
+                "post_visit": "분석 실패"
             }
         }
 

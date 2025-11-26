@@ -117,6 +117,19 @@ async def main():
         print(f"       🔑 키워드: {', '.join(p['keywords'][:3])}")
         print(f"       👤 특성: {p['persona']['characteristics'][:50]}...")
 
+        # CJM 정보 출력
+        if 'customer_journey_map' in p and p['customer_journey_map']:
+            cjm = p['customer_journey_map']
+            print(f"       🗺️  고객여정지도:")
+            if cjm.get('awareness'):
+                print(f"          - 인지: {cjm['awareness'][:50]}...")
+            if cjm.get('consideration'):
+                print(f"          - 고려: {cjm['consideration'][:50]}...")
+            if cjm.get('visit'):
+                print(f"          - 방문: {cjm['visit'][:50]}...")
+            if cjm.get('post_visit'):
+                print(f"          - 방문 후: {cjm['post_visit'][:50]}...")
+
     # 5단계: 결과 출력
     print("\n" + "=" * 60)
     print("📊 Step 5: 분석 결과 요약")
