@@ -1,198 +1,30 @@
-# Project PULSE: AI & Data Backend (FastAPI)
+# 📅 Project PULSE Development Journal
 
-**PULSE**는 AI/데이터 기반 리뷰 분석 백엔드입니다.
-이 백엔드는 **리뷰 크롤링, NLP 기반 토픽 분석, LLM 페르소나 생성**을 제공하며, Spring Boot 팀과 연동하여 전체 시스템을 구성합니다.
+## 2026-01-27 (화) - FastAPI 리팩토링 및 구조 잡기 🏗️
 
----
+### 1. 프로젝트 구조 개편 (Refactoring)
+기존의 `run_pipeline.py` 하나로 돌아가던 거대한 스크립트를 유지보수하기 좋게 **Layered Architecture**로 뜯어고쳤다. Spring Boot랑 비슷하게 구조를 잡으니 마음이 편하다.
 
-## 🏗️ 시스템 아키텍처 (Architecture)
+- **`app/api/`**: 엔드포인트(Controller). 요청을 받고 백그라운드 작업을 넘기는 역할.
+- **`app/services/`**: 핵심 로직(Service).
+    - `crawler_service.py`: 네이버/카카오맵 리뷰 수집 (Playwright 사용)
+    - `analysis_service.py`: BERTopic 토픽 모델링 & Singleton 패턴으로 모델 로딩 최적화
+    - `llm_service.py`: Upstage Solar API 연동하여 페르소나/요약 생성
+- **`app/schemas/`**: DTO 정의 (Pydantic). 프론트엔드쪽 필드명(`shopInfo_name` 등)이랑 맞춤.
 
-이 백엔드는 **MSA (Microservices Architecture)** 기반으로 구성되며, 독립적 데이터 파이프라인을 제공합니다.
+### 2. 비동기 처리 도입 (Async)
+분석 작업이 오래 걸리기 때문에(크롤링 + AI 연산), 사용자가 무한정 기다리지 않게 **Polling 방식**을 도입했다.
+1. `POST /request` → 즉시 **Task ID** 발급
+2. 백그라운드에서 크롤링 & 분석 뺑뺑이 🏃
+3. `GET /status/{task_id}` → 진행률(Progress Bar) 확인 가능
+4. `GET /result/{task_id}` → 최종 결과 수령
 
-- **Language**: Python 3.10+
-- **Framework**: FastAPI (확장 가능한 비동기 REST API 서버로 전환 예정)
-- **Core Libraries**:
-  - **Crawling**: `Playwright` (Naver/Kakao Map 동적 크롤링)
-  - **NLP**: `BERTopic`, `Kiwi`, `Sentence-Transformers` (토픽 모델링)
-  - **LLM**: `Upstage Solar-Pro2` (페르소나 생성 및 고객여정지도)
-  - **Data**: `Pandas` (데이터 전처리 및 분석)
+### 3. 검증 및 시뮬레이션 (Simulation)
+Spring Boot 서버가 아직 없어도 테스트 가능하게 `simulate_integration.py`를 만들어서 돌려봤다.
+- **테스트 케이스 1:** "바람난 얼큰 수제비" → 성공 ✅
+- **테스트 케이스 2:** "태평순대 본점" (복잡한 주소) → 성공 ✅
+- **결과:** 네이버 리뷰 35개 수집되고, 3가지 페르소나 그룹(단골/단체/혼밥러)으로 예쁘게 분석됨.
 
----
-
-## 🎯 주요 기능 (Key Features)
-
-### 1. 멀티 플랫폼 크롤링 (Dual-Platform Crawling)
-- **Naver Place & Kakao Map**: 두 주요 플랫폼에서 리뷰를 수집합니다.
-- **Headless Mode**: 브라우저 창 없이 백그라운드에서 데이터를 수집합니다.
-- **Smart Filtering**: "좋아요수" 등 불필요한 노이즈 텍스트를 제거하여 고품질 데이터를 확보합니다.
-- **Interactive Selection**: 검색 결과가 여러 개일 때, CLI 인터페이스로 원하는 가게를 선택할 수 있습니다.
-- **Auto Search**: 가게 이름만 입력하면 자동으로 네이버/카카오맵에서 검색하여 URL을 찾아줍니다.
-
-### 2. 지능형 데이터 분석 (Intelligent Analysis)
-- **BERTopic Modeling**: 리뷰 텍스트에서 주요 토픽(음식, 가격대, 서비스 등)을 자동으로 추출합니다.
-- **Noise Cleaning**: "리뷰 56", "사진 12" 등 UI 노이즈 데이터를 제거하여 깨끗한 텍스트만 분석합니다.
-
-### 3. LLM 페르소나 생성 (Persona Generation)
-- **Context-Aware**: 각 토픽별로 고유한 리뷰 데이터를 반영하여 생성합니다.
-- **Market-Compass Persona**: 실제 고객의 페르소나(특성, 선호사항, 목표, 불만사항)를 구체적으로 분석합니다.
-- **Store Image**: 모든 데이터를 종합하여 가게의 핵심 이미지를 한 문장으로 요약합니다.
-- **Customer Journey Map (CJM)**: 각 페르소나별로 4단계 고객여정(인지 → 고려 → 방문 → 방문 후)을 자동 생성합니다.
-
----
-
-## 📊 고객여정지도 (Customer Journey Map)
-
-**2025-11-26 업데이트**: 페르소나 생성 시 고객여정지도가 자동으로 포함됩니다!
-
-### CJM 데이터 구조
-각 페르소나는 다음 4단계 고객여정 정보를 포함합니다:
-
-```json
-{
-  "customer_journey_map": {
-    "awareness": "가게를 알게 된 경로 (SNS, 지인 추천, 검색 등)",
-    "consideration": "방문을 결심하게 된 결정적 요인 (메뉴 사진, 리뷰, 위치 등)",
-    "visit": "실제 매장에서의 경험 (대기, 주문, 식사, 분위기 등)",
-    "post_visit": "방문 후 행동 (재방문 의사, 리뷰 작성, 지인 추천 등)"
-  }
-}
-```
-
-### 출력 예시
-```
-[0] 맵찔이 수제비 탐험가
-    📊 비중: 31.4% (11개)
-    ⭐ 평점: 3.5/5.0
-    🔑 키워드: 수제비, 주문, 매장
-    👤 특성: 25-40세 여성 중심으로, 직장인이나 육아 중인 주부층...
-    🗺️  고객여정지도:
-       - 인지: SNS 피드나 지인 추천을 통해 가게를 처음 알게 됨...
-       - 고려: 매운맛 단계 조절 가능 여부와 위치 접근성 확인...
-       - 방문: 키오스크로 주문하며 맵기 단계를 신중히 선택...
-       - 방문 후: 만족 시 재방문하며 다음엔 더 매운 단계 도전...
-```
-
----
-
-## 📅 최근 변경 사항 (Changelog)
-
-### Phase 1: Naver Crawler + BERTopic (2025-11-21)
-- ✅ **Naver Crawler**: Playwright 기반 동적 리뷰 크롤링
-- ✅ **Text Cleaning**: 정규표현식(Regex)으로 노이즈 제거
-- ✅ **BERTopic**: CUDA 가속으로 토픽 모델링 최적화
-- ✅ **Visualization**: 토픽 결과를 CSV 파일로 저장
-
-### Phase 2: Multi-Platform + LLM Persona (2025-11-24)
-- ✅ **Kakao Crawler**: 카카오맵 리뷰(네이티브 앱) 크롤링 추가
-- ✅ **Unified Pipeline**: 네이버/카카오 데이터를 통합하여 분석하는 파이프라인 구축
-- ✅ **LLM Integration**: Upstage Solar-Pro2를 통해 토픽별 페르소나 생성 기능 추가
-- ✅ **Data Separation**: NLP용(토픽 모델링) 데이터와 LLM용(원문+메타) 데이터 분리
-
-### Phase 3: Optimization & UX (2025-11-25)
-- ✅ **Automatic Search**: 가게 이름만 입력하면 URL을 자동으로 검색하는 기능 추가
-- ✅ **Interactive Selection**: 검색 결과가 여러 개일 때 인터랙티브 선택 인터페이스(CLI) 제공 (선택 10초)
-- ✅ **Smart Filtering**: 불필요한 UI 텍스트를 제거하는 고급 필터링 로직 추가
-- ✅ **Headless Optimization**: 리뷰 크롤링 시 헤드리스 브라우저 모드로 성능 향상
-- ✅ **Refactoring**: `run_pipeline.py`로 전체 파이프라인을 통합 정리
-
-### Phase 4: Customer Journey Map (2025-11-26)
-- ✅ **CJM Integration**: 페르소나 생성 시 고객여정지도(Customer Journey Map) 자동 생성
-- ✅ **4-Stage Journey**: Awareness → Consideration → Visit → Post-Visit 단계별 분석
-- ✅ **Console Output**: 파이프라인 실행 시 CJM 요약을 콘솔에 출력
-- ✅ **JSON Export**: `persona.json`에 CJM 데이터 포함
-
----
-
-## 🚀 실행 방법 (How to Run)
-
-### 1. 가상환경 설정
-
-```bash
-# 가상환경 활성화
-.venv\Scripts\activate
-
-# 패키지 설치
-pip install -r requirements.txt
-
-# Playwright 브라우저 설치
-playwright install chromium
-```
-
-### 2. 파이프라인 실행
-
-```bash
-python run_pipeline.py
-```
-
-실행 후 가게 이름(예: "바람난 얼큰 수제비 범계점")을 입력하면 자동으로:
-1. 네이버/카카오맵에서 가게 검색
-2. 리뷰 크롤링 (각 플랫폼당 50개)
-3. BERTopic 토픽 분석
-4. 페르소나 및 고객여정지도 생성
-5. 결과를 `output/persona.json`에 저장
-
-### 3. 생성되는 파일
-
-```
-output/
-  ├── topic_summary.csv         # 토픽별 요약 (키워드, 비중)
-  ├── reviews_with_topics.csv   # 리뷰별 토픽 할당 상세
-  └── persona.json              # 페르소나 + CJM (최종 결과)
-```
-
----
-
-## 🔮 향후 업데이트 계획 (Future Updates)
-
-- [ ] **Video Generation**: `MoviePy`를 활용한 숏폼(Reels) 영상 자동 생성
-- [ ] **API Integration**: FastAPI 엔드포인트(`POST /api/analysis`)로 전환하여 Spring Boot와 연동
-- [ ] **DB Connection**: MongoDB(Raw Data) 및 MySQL(Meta Data) 연동
-- [ ] **Deployment**: Docker 컨테이너화 및 클라우드 배포
-- [ ] **Real-time CJM**: 실시간 리뷰 업데이트에 따른 CJM 동적 갱신
-
----
-
-## 🛠️ 기술 스택 요약
-
-| 구분 | 기술 |
-|------|------|
-| 언어 | Python 3.10+ |
-| 프레임워크 | FastAPI |
-| 크롤링 | Playwright (Chromium) |
-| NLP | BERTopic, Sentence-Transformers, Kiwi |
-| LLM | Upstage Solar-Pro2 |
-| 데이터 | Pandas, NumPy |
-| 배포 | Docker (예정) |
-
----
-
-## 🐛 문제 해결
-
-### 가게를 찾을 수 없음
-- 더 정확한 가게명 입력 (지점명 포함)
-- 네이버 지도에서 직접 검색 후 정확한 이름 확인
-
-### API 키 오류
-`.env` 파일에 API 키 추가:
-```bash
-UPSTAGE_API_KEY=your-api-key-here
-```
-
-### Playwright 오류
-```bash
-playwright install chromium
-```
-
----
-
-## 💡 팁
-
-1. **처음 실행은 느립니다**: Transformers 라이브러리 초기화에 1-2분 소요
-2. **두 번째 실행부터 빠름**: 캐싱으로 30초~1분이면 완료
-3. **리뷰 개수 조절**: 많을수록 정확하지만 시간 소요 (추천: 50개)
-4. **체인점은 지점명 필수**: "스타벅스" → "스타벅스 강남역점"
-
----
-
-**Last Updated: 2025-11-26**
-**Version: 4.0 (CJM Integration)**
+### � Next Step
+- 이제 Spring Boot에서 이 API 서버(`http://localhost:8000`)를 찔러서 데이터 받아가기만 하면 된다.
+- LLM API 키는 `.env`에 잘 숨겨둠.
