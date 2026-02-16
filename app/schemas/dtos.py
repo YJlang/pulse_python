@@ -33,6 +33,40 @@ class TaskStatusResponse(BaseModel):
     message: str       # 현재 진행 중인 작업 설명 (예: "네이버 리뷰 수집 중...")
     result: Optional[Dict[str, Any]] = None # 완료 시 결과 데이터 포함
 
+class JourneyStep(BaseModel):
+    """
+    고객 여정 지도의 각 단계 (탐색, 방문, 식사, 공유)
+    """
+    label: str         # 단계 이름 (탐색, 방문, 식사, 공유)
+    action: str        # 행동
+    thought: str       # 속마음
+    type: str          # 감정 상태 (good, neutral, pain)
+    touchpoint: str    # 접점
+    painPoint: Optional[str] = None # 불편 요소 (Optional)
+    opportunity: str   # 기회 요소 (PULSE의 제안)
+
+class JourneyMap(BaseModel):
+    """
+    전체 고객 여정 지도
+    """
+    explore: JourneyStep
+    visit: JourneyStep
+    eat: JourneyStep
+    share: JourneyStep
+
+class PersonaItem(BaseModel):
+    """
+    개별 페르소나 데이터 (FE: UnifiedInsightPage.jsx - PERSONAS 구조와 일치)
+    """
+    id: int
+    nickname: str      # 페르소나 별명 (예: 시원 국물파)
+    tags: List[str]    # 특징 태그 (예: ["해장러", "혼밥"])
+    img: str           # 이미지 URL (DiceBear)
+    summary: str       # 한 줄 요약
+    journey: JourneyMap # 고객 여정 지도
+    overall_comment: Optional[str] = None  # LLM 생성 분석 총평
+    action_recommendation: Optional[str] = None  # LLM 생성 액션 제안
+
 class PersonaResponse(BaseModel):
     """
     최종 페르소나 결과 DTO
@@ -41,4 +75,4 @@ class PersonaResponse(BaseModel):
     average_rating: float
     total_reviews: int
     store_summary: str
-    personas: List[Dict[str, Any]] # 상세 페르소나 리스트
+    personas: List[PersonaItem] # 상세 페르소나 리스트

@@ -22,8 +22,11 @@ class MongoService:
             
         # 로컬 MongoDB 연결 (기본 포트 27017)
         # 실제 배포 시에는 환경변수에서 MONGO_URI를 가져와야 합니다.
-        self.client = MongoClient("mongodb://localhost:27017/")
-        self.db = self.client["pulse_db"] # DB 이름: pulse_db
+        mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+        db_name = os.getenv("MONGO_DB_NAME", "pulse_db")
+        
+        self.client = MongoClient(mongo_uri)
+        self.db = self.client[db_name] # DB 이름: pulse_db
         self.collection = self.db["analysis_results"] # 컬렉션: analysis_results
         
         self.initialized = True

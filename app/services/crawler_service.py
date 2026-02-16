@@ -3,6 +3,8 @@
 """
 import asyncio
 import re
+import sys
+import threading
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright
 from app.utils.logger import get_logger
@@ -295,18 +297,54 @@ class CrawlerService:
         """
         네이버와 카카오맵 리뷰를 동시에 수집합니다.
         가게 이름과 주소를 조합하여 검색 정확도를 높입니다.
+        
+        Windows에서는 Uvicorn의 SelectorEventLoop과 Playwright의 ProactorEventLoop
+        충돌을 피하기 위해, 별도 스레드에서 새로운 ProactorEventLoop을 생성하여 실행합니다.
         """
-        query = f"{address} {store_name}" # 주소 + 이름으로 검색
-        
+        query = f"{address} {store_name}"
         logger.info(f"🔎 Starting concurrent crawling for: {query}")
-        
-        # 비동기 병렬 실행
-        naver_task = asyncio.create_task(self.crawl_naver(query))
-        kakao_task = asyncio.create_task(self.crawl_kakao(query))
-        
-        results = await asyncio.gather(naver_task, kakao_task)
-        
+
+        async def _crawl_all():
+            naver_task = asyncio.create_task(self.crawl_naver(query))
+            kakao_task = asyncio.create_task(self.crawl_kakao(query))
+            return await asyncio.gather(naver_task, kakao_task)
+
+        if sys.platform == 'win32':
+            # Windows: Uvicorn uses SelectorEventLoop which can't spawn subprocesses.
+            # Run Playwright in a dedicated thread with its own ProactorEventLoop.
+            result_container = {}
+
+            def _run_in_thread():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # ProactorEventLoop is the default on Windows when creating a new loop
+                    # but let's be explicit
+                    if not isinstance(loop, asyncio.ProactorEventLoop):
+                        loop.close()
+                        loop = asyncio.ProactorEventLoop()
+                        asyncio.set_event_loop(loop)
+                    result_container['result'] = loop.run_until_complete(_crawl_all())
+                except Exception as e:
+                    result_container['error'] = e
+                finally:
+                    loop.close()
+
+            thread = threading.Thread(target=_run_in_thread)
+            thread.start()
+            
+            # await를 사용하여 메인 루프를 블로킹하지 않고 스레드 완료 대기
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, thread.join)
+
+            if 'error' in result_container:
+                raise result_container['error']
+            results = result_container['result']
+        else:
+            # Linux/Mac: 이벤트 루프 충돌 없음, 직접 실행
+            results = await _crawl_all()
+
         all_reviews = results[0] + results[1]
         logger.info(f"📊 Total reviews collected: {len(all_reviews)} (Naver: {len(results[0])}, Kakao: {len(results[1])})")
-        
+
         return all_reviews
