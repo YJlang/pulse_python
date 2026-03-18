@@ -18,6 +18,11 @@ def get_logger(name: str):
     # 이미 핸들러가 설정되어 있다면 중복 추가 방지
     if not logger.handlers:
         logger.setLevel(logging.INFO)
+
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         
         # 콘솔 출력을 위한 핸들러
         handler = logging.StreamHandler(sys.stdout)

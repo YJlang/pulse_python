@@ -2,6 +2,11 @@ import sys
 import subprocess
 import importlib.util
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 def check_package(package_name):
     spec = importlib.util.find_spec(package_name)
     return spec is not None

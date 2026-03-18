@@ -3,6 +3,8 @@ LLM 기반 페르소나 및 요약 생성 서비스
 """
 import os
 import json
+import re
+from collections import Counter
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -31,6 +33,121 @@ class LLMService:
         ratings = [r.get('rating') for r in reviews if r.get('rating') is not None]
         if not ratings: return 0.0
         return round(sum(ratings) / len(ratings), 1)
+
+    @staticmethod
+    def _extract_fallback_keywords(reviews: List[Dict], limit: int = 8) -> List[str]:
+        """
+        토픽 모델이 실패했을 때 리뷰 본문에서 자주 등장한 단어를 간이 키워드로 사용합니다.
+        """
+        stopwords = {
+            "스타벅스", "강남교보타워", "강남교보타워r점", "정말", "너무", "진짜",
+            "그리고", "그냥", "항상", "이번", "다음", "방문", "매장", "가게",
+            "주문", "메뉴", "음료", "커피", "디저트", "고객", "분위기"
+        }
+        counter = Counter()
+
+        for review in reviews:
+            text = review.get("text") or review.get("raw_text") or ""
+            for token in re.findall(r"[가-힣A-Za-z]{2,}", text):
+                normalized = token.lower()
+                if normalized in stopwords:
+                    continue
+                counter[normalized] += 1
+
+        return [token for token, _ in counter.most_common(limit)]
+
+    def _build_fallback_persona_groups(self, reviews: List[Dict]) -> List[Dict[str, Any]]:
+        """
+        토픽 모델 결과가 부족할 때 리뷰 내용을 3개의 대표 그룹으로 재구성합니다.
+        FE는 항상 top3 페르소나를 기대하므로, 그룹 수가 부족하면 분할/패딩합니다.
+        """
+        theme_specs = [
+            {
+                "seed": "hangover",
+                "default_keywords": ["맛", "시그니처", "디저트"],
+                "match_tokens": ["맛", "디저트", "케이크", "샌드위치", "커피", "라떼", "음료", "에스프레소"],
+            },
+            {
+                "seed": "worker",
+                "default_keywords": ["쿠폰", "가성비", "빠른 픽업"],
+                "match_tokens": ["쿠폰", "픽업", "빠른", "가성비", "할인", "이벤트", "출근", "주문"],
+            },
+            {
+                "seed": "couple",
+                "default_keywords": ["좌석", "분위기", "친절"],
+                "match_tokens": ["좌석", "자리", "매장", "친절", "분위기", "조용", "편안", "공간"],
+            },
+        ]
+
+        grouped_reviews = [[] for _ in theme_specs]
+
+        for index, review in enumerate(reviews):
+            text = (review.get("text") or review.get("raw_text") or "").lower()
+            scores = [
+                sum(1 for token in spec["match_tokens"] if token in text)
+                for spec in theme_specs
+            ]
+
+            if max(scores) == 0:
+                target_index = index % len(theme_specs)
+            else:
+                target_index = scores.index(max(scores))
+
+            grouped_reviews[target_index].append(review)
+
+        # 비어 있는 그룹은 전체 리뷰를 순환 배분해 항상 3개를 채웁니다.
+        for index, group in enumerate(grouped_reviews):
+            if group:
+                continue
+
+            fallback_review = reviews[index % len(reviews)]
+            group.append(fallback_review)
+
+        groups = []
+        for index, spec in enumerate(theme_specs):
+            group_reviews = grouped_reviews[index]
+            extracted_keywords = self._extract_fallback_keywords(group_reviews, limit=5)
+            merged_keywords = []
+
+            for keyword in spec["default_keywords"] + extracted_keywords:
+                if keyword and keyword not in merged_keywords:
+                    merged_keywords.append(keyword)
+
+            groups.append({
+                "topic_id": -(index + 1),
+                "reviews": group_reviews,
+                "keywords": merged_keywords[:8],
+                "percentage": round((len(group_reviews) / max(len(reviews), 1)) * 100, 1),
+                "seed": spec["seed"],
+            })
+
+        return groups
+
+    @staticmethod
+    def _build_persona_image(seed: str) -> str:
+        """
+        프론트 mock 데이터와 동일한 DiceBear Adventurer 스타일을 사용합니다.
+        """
+        return f"https://api.dicebear.com/7.x/adventurer/svg?seed={seed}"
+
+    def _map_persona_response(
+        self,
+        persona_index: int,
+        p_data: Dict[str, Any],
+        fallback_keywords: List[str],
+        seed: str,
+        fallback_nickname: str,
+    ) -> Dict[str, Any]:
+        return {
+            "id": persona_index,
+            "nickname": p_data.get("nickname", fallback_nickname),
+            "tags": p_data.get("tags") or fallback_keywords[:3],
+            "img": self._build_persona_image(seed),
+            "summary": p_data.get("summary", ""),
+            "journey": p_data.get("journey", {}),
+            "overall_comment": p_data.get("overall_comment"),
+            "action_recommendation": p_data.get("action_recommendation")
+        }
 
     def generate_store_summary(self, reviews: List[Dict], topics: Dict[int, List[str]], store_name: str) -> str:
         """
@@ -196,13 +313,9 @@ JSON 없이 텍스트만 출력하세요.
         # 2. 토픽별 페르소나 (최대 3개까지만 생성 - FE 레이아웃 고려)
         personas = []
         
-        # DiceBear 시드 목록 (랜덤성 부여)
-        seeds = ["happy-woman-1", "happy-man-2", "happy-woman-2", "happy-man-1", "happy-woman-3"]
-        bg_colors = ["fef3c7", "d1fae5", "fce7f3", "e0f2fe", "fef9c3"]
-        
         sorted_topics = sorted(topics.keys())[:3] # 상위 3개만
-        
-        for idx, t_id in enumerate(sorted_topics):
+
+        for t_id in sorted_topics:
             count = topic_counts[t_id]
             percentage = round((count / total_docs) * 100, 1)
             
@@ -213,21 +326,39 @@ JSON 없이 텍스트만 출력하세요.
             p_data = self._generate_single_persona(
                 t_id, topics[t_id], topic_reviews, store_name, percentage
             )
-            
-            # 이미지 생성 (DiceBear API)
-            seed = seeds[idx % len(seeds)]
-            bg = bg_colors[idx % len(bg_colors)]
-            img_url = f"https://api.dicebear.com/7.x/notionists/svg?seed={seed}&backgroundColor={bg}"
-            
-            # 결과 매핑
-            personas.append({
-                "id": idx + 1, # FE에서는 1부터 시작하는 ID 사용
-                "nickname": p_data.get("nickname", f"그룹 {t_id}"),
-                "tags": p_data.get("tags", []),
-                "img": img_url,
-                "summary": p_data.get("summary", ""),
-                "journey": p_data.get("journey", {})
-            })
+
+            personas.append(
+                self._map_persona_response(
+                    len(personas) + 1,
+                    p_data,
+                    topics[t_id],
+                    f"topic-{len(personas) + 1}",
+                    f"대표 고객 그룹 {len(personas) + 1}",
+                )
+            )
+
+        if len(personas) < 3 and reviews:
+            fallback_groups = self._build_fallback_persona_groups(reviews)
+            for group in fallback_groups:
+                if len(personas) >= 3:
+                    break
+
+                p_data = self._generate_single_persona(
+                    group["topic_id"],
+                    group["keywords"],
+                    group["reviews"],
+                    store_name,
+                    group["percentage"],
+                )
+                personas.append(
+                    self._map_persona_response(
+                        len(personas) + 1,
+                        p_data,
+                        group["keywords"],
+                        group["seed"],
+                        f"대표 고객 그룹 {len(personas) + 1}",
+                    )
+                )
             
         return {
             "store_name": store_name,
@@ -252,10 +383,41 @@ JSON 없이 텍스트만 출력하세요.
             logger.error(f"❌ Error during chat completion: {e}")
             return "죄송합니다. 오류가 발생하여 응답을 생성할 수 없습니다."
 
-    def generate_review_reply(self, review_text: str, tone: str = "친근함", length: str = "보통") -> str:
+    @staticmethod
+    def _find_matching_exception_cases(review_text: str, exception_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        lowered = (review_text or "").lower()
+        matches = []
+        for exception_case in exception_cases or []:
+            if not exception_case.get("enabled"):
+                continue
+            keywords = exception_case.get("keywords") or []
+            if any((keyword or "").lower() in lowered for keyword in keywords):
+                matches.append(exception_case)
+        return matches
+
+    def generate_review_reply(
+        self,
+        review_text: str,
+        tone: str = "친근함",
+        length: str = "보통",
+        settings: Dict[str, Any] | None = None,
+    ) -> str:
         """
         리뷰에 대한 답글을 생성합니다.
         """
+        settings = settings or {}
+        matched_cases = self._find_matching_exception_cases(
+            review_text,
+            settings.get("exceptionCases") or [],
+        )
+
+        exception_case_guide = "\n".join(
+            [
+                f"- 유형: {case.get('type')}\n  공감: {case.get('empathy')}\n  사과: {case.get('apology')}\n  해결: {case.get('solution')}"
+                for case in matched_cases
+            ]
+        ) or "- 해당 없음"
+
         prompt = f"""
 당신은 사장님을 대신해 고객 리뷰에 답글을 다는 AI 비서입니다.
 다음 리뷰에 대해 **{tone}** 말투로, **{length}** 길이의 답글을 작성해주세요.
@@ -263,9 +425,43 @@ JSON 없이 텍스트만 출력하세요.
 [고객 리뷰]
 {review_text}
 
+[답글 설정]
+- 감사 인사 포함: {"예" if settings.get("includeThanks", True) else "아니오"}
+- '좋은 하루 보내세요' 포함: {"예" if settings.get("includeGreatDay", True) else "아니오"}
+- 이모지 사용: {"예" if settings.get("useEmojis", False) else "아니오"}
+- 브랜드 프리셋: {settings.get("brandPreset") or "없음"}
+- 추가 요청: {settings.get("optionalInstruction") or "없음"}
+
+[예외 케이스 가이드]
+{exception_case_guide}
+
 [답글 작성 가이드]
 1. 고객의 칭찬 포인트에 감사함을 표현하세요.
 2. 불만 사항이 있다면 정중히 사과하고 개선을 약속하세요.
 3. 재방문을 유도하는 따뜻한 멘트로 마무리하세요.
 """
         return self.chat_completion([{"role": "user", "content": prompt}])
+
+    def generate_review_replies(self, shop_name: str, reviews: List[Dict[str, Any]], settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+        replies = []
+
+        for index, review in enumerate(reviews):
+            review_text = review.get("text") or review.get("raw_text") or ""
+            if review.get("has_photo") and settings.get("photoThanks", True):
+                review_text = f"{review_text}\n\n[참고] 이 리뷰는 사진이 포함된 리뷰입니다."
+
+            content = self.generate_review_reply(
+                review_text=review_text,
+                tone=settings.get("tone", "친근함"),
+                length=settings.get("length", "보통"),
+                settings=settings,
+            )
+
+            replies.append({
+                "id": f"reply-{review.get('id')}",
+                "review_id": review.get("id"),
+                "content": content,
+                "is_recommended": index == 0,
+            })
+
+        return replies

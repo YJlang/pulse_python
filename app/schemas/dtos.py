@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 
 # =========================================================
@@ -76,3 +76,64 @@ class PersonaResponse(BaseModel):
     total_reviews: int
     store_summary: str
     personas: List[PersonaItem] # 상세 페르소나 리스트
+
+
+class ReviewSnapshotItem(BaseModel):
+    id: str
+    source: str
+    source_label: str
+    author: str
+    rating: Optional[float] = None
+    date: Optional[str] = None
+    has_photo: bool = False
+    text: str
+    raw_text: str
+
+
+class ReviewSnapshotResponse(BaseModel):
+    store_name: str
+    address: str
+    total_reviews: int
+    source_counts: Dict[str, int]
+    last_crawled_at: Optional[str] = None
+    reviews: List[ReviewSnapshotItem]
+
+
+class ReviewReplyInput(BaseModel):
+    id: str
+    source: str
+    author: str = "리뷰어"
+    rating: Optional[float] = None
+    date: Optional[str] = None
+    has_photo: bool = False
+    text: str
+    raw_text: Optional[str] = None
+
+
+class ReviewReplySettings(BaseModel):
+    tone: str = "친근함"
+    length: str = "보통"
+    includeThanks: bool = True
+    includeGreatDay: bool = True
+    useEmojis: bool = False
+    photoThanks: bool = True
+    brandPreset: str = ""
+    optionalInstruction: str = ""
+    exceptionCases: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class GenerateReviewRepliesRequest(BaseModel):
+    shop_name: str
+    reviews: List[ReviewReplyInput]
+    settings: ReviewReplySettings
+
+
+class GeneratedReviewReply(BaseModel):
+    id: str
+    review_id: str
+    content: str
+    is_recommended: bool = False
+
+
+class GenerateReviewRepliesResponse(BaseModel):
+    replies: List[GeneratedReviewReply]
