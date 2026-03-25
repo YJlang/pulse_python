@@ -35,13 +35,152 @@ class CrawlerService:
         cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned.strip()
 
+    # Keep a UTF-8-safe normalizer here because the legacy regex above can be
+    # corrupted on Windows terminals and strip Hangul from search queries.
+    @staticmethod
+    def _normalize_search_text(text: str) -> str:
+        cleaned = re.sub(r"\([^)]*\)", " ", text or "")
+        cleaned = re.sub(r"[^0-9A-Za-z\uAC00-\uD7A3\s]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
     @classmethod
-    def _build_search_query(cls, store_name: str, address: str) -> str:
+    def _build_search_query(
+        cls,
+        store_name: str,
+        address: str,
+        include_address: bool = True,
+    ) -> str:
         normalized_store = cls._normalize_search_text(store_name)
         normalized_address = cls._normalize_search_text(address)
         address_parts = normalized_address.split()
         concise_address = " ".join(address_parts[:4]) if address_parts else ""
+        if include_address and normalized_store and concise_address:
+            return f"{normalized_store} {concise_address}".strip()
         return normalized_store or concise_address
+
+    @classmethod
+    def _compact_search_text(cls, text: str) -> str:
+        return re.sub(r"\s+", "", cls._normalize_search_text(text).lower())
+
+    @classmethod
+    def _tokenize_search_text(cls, text: str, limit: int | None = None) -> List[str]:
+        tokens = [
+            token
+            for token in cls._compact_search_text(text).split()
+            if token
+        ]
+        if not tokens:
+            tokens = [
+                token
+                for token in (
+                    cls._compact_search_text(chunk)
+                    for chunk in cls._normalize_search_text(text).lower().split()
+                )
+                if len(token) >= 2
+            ]
+        return tokens[:limit] if limit is not None else tokens
+
+    @classmethod
+    def _build_match_context(cls, store_name: str, address: str) -> Dict[str, object]:
+        store_tokens = [
+            token
+            for token in (
+                cls._compact_search_text(chunk)
+                for chunk in cls._normalize_search_text(store_name).lower().split()
+            )
+            if len(token) >= 2
+        ]
+        address_tokens = [
+            token
+            for token in (
+                cls._compact_search_text(chunk)
+                for chunk in cls._normalize_search_text(address).lower().split()
+            )
+            if len(token) >= 2
+        ][:5]
+        branch_tokens = store_tokens[1:] if len(store_tokens) > 1 else store_tokens
+        return {
+            "store_compact": cls._compact_search_text(store_name),
+            "store_tokens": store_tokens,
+            "branch_tokens": branch_tokens,
+            "address_tokens": address_tokens,
+        }
+
+    @classmethod
+    def _score_search_candidate(cls, candidate: Dict[str, str], store_name: str, address: str) -> int:
+        match_context = cls._build_match_context(store_name, address)
+        title_compact = cls._compact_search_text(candidate.get("title", ""))
+        address_compact = cls._compact_search_text(candidate.get("address", ""))
+        context_compact = cls._compact_search_text(candidate.get("context", ""))
+        merged_compact = " ".join(
+            value
+            for value in (title_compact, address_compact, context_compact)
+            if value
+        )
+
+        score = 0
+        store_compact = match_context["store_compact"]
+        if store_compact:
+            if title_compact == store_compact:
+                score += 160
+            elif store_compact in title_compact:
+                score += 120
+            elif store_compact in merged_compact:
+                score += 80
+
+        brand_tokens = match_context["store_tokens"]
+        if brand_tokens:
+            brand_token = brand_tokens[0]
+            if brand_token in title_compact:
+                score += 12
+            elif brand_token in merged_compact:
+                score += 6
+
+        for token in match_context["branch_tokens"]:
+            if token in title_compact:
+                score += 36
+            elif token in merged_compact:
+                score += 18
+
+        address_hits = 0
+        for token in match_context["address_tokens"]:
+            if token in address_compact:
+                score += 14
+                address_hits += 1
+            elif token in merged_compact:
+                score += 8
+                address_hits += 1
+
+        if address_hits >= 2:
+            score += 24
+        if address_hits >= 3:
+            score += 18
+
+        return score
+
+    @classmethod
+    def _select_best_candidate(
+        cls,
+        candidates: List[Dict[str, str]],
+        store_name: str,
+        address: str,
+    ) -> Dict[str, str] | None:
+        scored_candidates = []
+        for candidate in candidates:
+            scored_candidate = dict(candidate)
+            scored_candidate["match_score"] = cls._score_search_candidate(
+                candidate,
+                store_name,
+                address,
+            )
+            scored_candidates.append(scored_candidate)
+
+        if not scored_candidates:
+            return None
+
+        scored_candidates.sort(key=lambda candidate: candidate.get("match_score", 0), reverse=True)
+        return scored_candidates[0]
 
     @staticmethod
     def _clean_review_text(text: str) -> str:
@@ -163,24 +302,90 @@ class CrawlerService:
 
         return click_count
 
-    async def _resolve_naver_detail_url(self, page: Page) -> str | None:
+    async def _extract_naver_search_candidates(self, page: Page) -> List[Dict[str, str]]:
+        return await page.evaluate(
+            """
+            () => {
+              const candidates = [];
+              const seen = new Set();
+              const links = Array.from(
+                document.querySelectorAll('a[href*="/restaurant/"], a[href*="/place/"]')
+              );
+
+              for (const link of links) {
+                const href = link.getAttribute('href') || '';
+                if (!/^\\/(restaurant|place)\\/\\d+(?:\\?.*)?$/.test(href)) {
+                  continue;
+                }
+
+                const absoluteHref = href.startsWith('http')
+                  ? href
+                  : `https://m.place.naver.com${href}`;
+                const dedupeKey = absoluteHref.split('?')[0];
+                if (seen.has(dedupeKey)) {
+                  continue;
+                }
+
+                seen.add(dedupeKey);
+                const container =
+                  link.closest('li') ||
+                  link.closest('article') ||
+                  link.parentElement;
+
+                candidates.push({
+                  href: absoluteHref,
+                  title: (link.innerText || '').trim(),
+                  address: '',
+                  context: (container?.innerText || '').trim(),
+                });
+
+                if (candidates.length >= 10) {
+                  break;
+                }
+              }
+
+              return candidates;
+            }
+            """
+        )
+
+    async def _extract_kakao_search_candidates(self, page: Page) -> List[Dict[str, str]]:
+        return await page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('li[data-id]')).slice(0, 10).map((item) => ({
+              data_id: item.getAttribute('data-id') || '',
+              title:
+                item.querySelector('strong')?.innerText?.trim() ||
+                item.querySelector('.tit_location')?.innerText?.trim() ||
+                '',
+              address:
+                item.querySelector('.txt_address')?.innerText?.trim() ||
+                item.querySelector('.addr')?.innerText?.trim() ||
+                '',
+              context: (item.innerText || '').trim(),
+            })).filter((candidate) => candidate.data_id);
+            """
+        )
+
+    async def _resolve_naver_detail_url(self, page: Page, store_name: str, address: str) -> str | None:
         path = page.url.split("?", 1)[0]
         if re.search(r"/(?:restaurant|place)/\d+$", path):
             return page.url
 
-        result_links = page.locator(self.NAVER_DETAIL_LINK_SELECTOR)
-        link_count = await result_links.count()
-        for index in range(link_count):
-            href = await result_links.nth(index).get_attribute("href")
-            if not href:
-                continue
-            if not re.search(r"/(?:restaurant|place)/\d+", href):
-                continue
-            return href if href.startswith("http") else f"https://m.place.naver.com{href}"
+        candidates = await self._extract_naver_search_candidates(page)
+        best_candidate = self._select_best_candidate(candidates, store_name, address)
+        if best_candidate:
+            logger.info(
+                "[Naver] Selected candidate: %s (score=%s)",
+                best_candidate.get("title") or best_candidate.get("href"),
+                best_candidate.get("match_score", 0),
+            )
+            return best_candidate.get("href")
 
         return None
 
-    async def crawl_naver(self, query: str, max_reviews: int = 80) -> List[Dict]:
+    async def crawl_naver(self, store_name: str, address: str, max_reviews: int = 80) -> List[Dict]:
+        query = self._build_search_query(store_name, address)
         logger.info("[Naver] Searching for: %s", query)
         reviews: List[Dict] = []
         seen_ids = set()
@@ -198,7 +403,7 @@ class CrawlerService:
                 await page.goto(search_url, wait_until="networkidle", timeout=30000)
                 await page.wait_for_timeout(2500)
 
-                detail_url = await self._resolve_naver_detail_url(page)
+                detail_url = await self._resolve_naver_detail_url(page, store_name, address)
                 if not detail_url:
                     logger.warning("[Naver] No detail page found from search results.")
                     return []
@@ -249,7 +454,8 @@ class CrawlerService:
 
         return reviews[:max_reviews]
 
-    async def crawl_kakao(self, query: str, max_reviews: int = 80) -> List[Dict]:
+    async def crawl_kakao(self, store_name: str, address: str, max_reviews: int = 80) -> List[Dict]:
+        query = self._build_search_query(store_name, address, include_address=False)
         logger.info("[Kakao] Searching for: %s", query)
         reviews: List[Dict] = []
         seen_ids = set()
@@ -267,12 +473,23 @@ class CrawlerService:
                 await page.goto(search_url, wait_until="networkidle", timeout=30000)
                 await page.wait_for_timeout(2000)
 
-                first_item = page.locator("li[data-id]").first
-                if await first_item.count() == 0:
+                candidates = await self._extract_kakao_search_candidates(page)
+                if not candidates:
                     logger.warning("[Kakao] No search results found.")
                     return []
 
-                data_id = await first_item.get_attribute("data-id")
+                best_candidate = self._select_best_candidate(candidates, store_name, address)
+                if not best_candidate:
+                    logger.warning("[Kakao] No candidate matched the requested store.")
+                    return []
+
+                logger.info(
+                    "[Kakao] Selected candidate: %s (score=%s)",
+                    best_candidate.get("title") or best_candidate.get("data_id"),
+                    best_candidate.get("match_score", 0),
+                )
+
+                data_id = best_candidate.get("data_id")
                 review_url = f"https://place.map.kakao.com/{data_id}#review"
                 await page.goto(review_url, wait_until="networkidle", timeout=30000)
                 await page.wait_for_timeout(2500)
@@ -385,8 +602,8 @@ class CrawlerService:
         logger.info("Starting concurrent crawling for: %s", query)
 
         async def _crawl_all():
-            naver_task = asyncio.create_task(self.crawl_naver(query, max_reviews=80))
-            kakao_task = asyncio.create_task(self.crawl_kakao(query, max_reviews=80))
+            naver_task = asyncio.create_task(self.crawl_naver(store_name, address, max_reviews=80))
+            kakao_task = asyncio.create_task(self.crawl_kakao(store_name, address, max_reviews=80))
             return await asyncio.gather(naver_task, kakao_task)
 
         if sys.platform == "win32":

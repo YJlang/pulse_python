@@ -27,7 +27,31 @@ class LLMService:
         
         # OpenAI 클라이언트 초기화
         self.client = OpenAI(api_key=api_key)
-        self.model = "gpt-4o" # 모델명 변경: solar-pro2 -> gpt-4o
+        self.model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
+    def _create_chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float | None = None,
+        response_format: Dict[str, Any] | None = None,
+    ):
+        """
+        Centralize chat-completions calls so model-specific parameter quirks
+        can be handled in one place.
+        """
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+
+        if response_format is not None:
+            params["response_format"] = response_format
+
+        # GPT-5 chat-completions currently only supports the default temperature.
+        if temperature is not None and not self.model.startswith("gpt-5"):
+            params["temperature"] = temperature
+
+        return self.client.chat.completions.create(**params)
 
     def _calculate_avg_rating(self, reviews: List[Dict]) -> float:
         ratings = [r.get('rating') for r in reviews if r.get('rating') is not None]
@@ -183,10 +207,9 @@ class LLMService:
 JSON 없이 텍스트만 출력하세요.
 """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            response = self._create_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.7
+                temperature=0.7,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -269,14 +292,13 @@ JSON 없이 텍스트만 출력하세요.
 }}
 """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            response = self._create_chat_completion(
                 messages=[
                     {"role": "system", "content": "You are a helpful CX analyst. Output only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
             )
             result_text = response.choices[0].message.content.strip()
             return json.loads(result_text)
@@ -373,10 +395,9 @@ JSON 없이 텍스트만 출력하세요.
         일반적인 대화형 응답을 생성합니다. (챗봇 기능 등)
         """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            response = self._create_chat_completion(
                 messages=messages,
-                temperature=temperature
+                temperature=temperature,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:

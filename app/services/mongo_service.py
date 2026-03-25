@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 class MongoService:
     _instance = None
-    SNAPSHOT_VERSION = 4
+    SNAPSHOT_VERSION = 5
     
     def __new__(cls):
         if cls._instance is None:
