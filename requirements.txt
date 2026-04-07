@@ -10,3 +10,8 @@ numpy
 scikit-learn
 pymongo
 requests
+pytest
+python-multipart
+google-genai
+google-cloud-storage
+dspy-ai>=3.1.2

@@ -137,3 +137,34 @@ class GeneratedReviewReply(BaseModel):
 
 class GenerateReviewRepliesResponse(BaseModel):
     replies: List[GeneratedReviewReply]
+
+
+class PromotionVideoResult(BaseModel):
+    videoUrl: str
+    videoTitle: str
+    hashtags: List[str]
+    generationTime: Optional[str] = None
+
+
+class PromotionPromptPreviewResponse(BaseModel):
+    title: str
+    hashtags: List[str]
+    metadata: Dict[str, Any]
+    key_elements: List[str]
+    negative_prompts: List[str]
+    timeline: List[Dict[str, Any]]
+
+
+class PromotionPromptRecommendationResponse(BaseModel):
+    recommendedPrompt: str
+    videoTitle: str
+    hashtags: List[str]
+    metadata: Dict[str, Any]
+
+
+class PromotionTaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    progress: int
+    message: str
+    data: Optional[PromotionVideoResult] = None

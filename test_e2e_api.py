@@ -1,88 +1,81 @@
+"""
+Live FastAPI API smoke test.
 
-import requests
+Skipped by default. Run it explicitly by setting RUN_PULSE_E2E=1.
+"""
+
+from __future__ import annotations
+
+import os
 import time
-import json
-import sys
 
-# Constants
-BASE_URL = "http://127.0.0.1:8000/api"
-STORE_NAME = "바람난 얼큰 수제비 범계점"
-ADDRESS = "경기 안양시 동안구 평촌대로223번길 48 백운빌딩 301호 바람난 얼큰 수제비"
+import pytest
+import requests
 
-def main():
-    print(f"🚀 Starting E2E API Test for: {STORE_NAME}")
+BASE_URL = os.getenv("PULSE_FASTAPI_BASE", "http://127.0.0.1:8000/api")
+HEALTHCHECK_URL = os.getenv("PULSE_FASTAPI_HEALTH", "http://127.0.0.1:8000/")
+RUN_E2E = os.getenv("RUN_PULSE_E2E") == "1"
 
-    # 1. Request Analysis
-    print("\n1️⃣ Requesting Analysis...")
-    payload = {
-        "shopInfo_name": STORE_NAME,
-        "shopInfo_address": ADDRESS
-    }
+STORE_NAME = "바람난왕족발보쌈 범계점"
+ADDRESS = "경기 안양시 동안구 평촌대로223번길 48 백운빌딩 301호 바람난왕족발보쌈"
+
+pytestmark = pytest.mark.e2e
+
+
+def _require_live_server() -> None:
+    if not RUN_E2E:
+        pytest.skip("Set RUN_PULSE_E2E=1 to run live FastAPI E2E tests.")
+
     try:
-        resp = requests.post(f"{BASE_URL}/analysis/request", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        task_id = data["task_id"]
-        print(f"✅ Request Accepted! Task ID: {task_id}")
-    except Exception as e:
-        print(f"❌ Analysis Request Failed: {e}")
-        try: print(resp.text)
-        except: pass
-        sys.exit(1)
+        response = requests.get(HEALTHCHECK_URL, timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        pytest.skip(f"FastAPI server unavailable: {exc}")
 
-    # 2. Poll Status
-    print("\n2️⃣ Polling Status...")
+
+def test_e2e_api_smoke() -> None:
+    _require_live_server()
+
+    request_response = requests.post(
+        f"{BASE_URL}/analysis/request",
+        json={
+            "shopInfo_name": STORE_NAME,
+            "shopInfo_address": ADDRESS,
+        },
+        timeout=10,
+    )
+    assert request_response.status_code == 200, request_response.text
+
+    task_id = request_response.json()["task_id"]
+
     while True:
-        try:
-            resp = requests.get(f"{BASE_URL}/analysis/status/{task_id}")
-            resp.raise_for_status()
-            status_data = resp.json()
-            status = status_data["status"]
-            progress = status_data["progress"]
-            message = status_data["message"]
-            
-            print(f"   Now: [{status.upper()}] {progress}% - {message}")
-            
-            if status == "completed":
-                print("✅ Analysis Completed!")
-                break
-            elif status == "failed":
-                print(f"❌ Analysis Failed: {message}")
-                sys.exit(1)
-            
-            time.sleep(2)
-        except Exception as e:
-            print(f"❌ Polling Failed: {e}")
-            sys.exit(1)
+        status_response = requests.get(
+            f"{BASE_URL}/analysis/status/{task_id}",
+            timeout=10,
+        )
+        assert status_response.status_code == 200, status_response.text
 
-    # 3. Get Result
-    print("\n3️⃣ Retrieving Final Result...")
-    try:
-        resp = requests.get(f"{BASE_URL}/analysis/result/{task_id}")
-        resp.raise_for_status()
-        result = resp.json()
-        
-        # Validate Result
-        personas = result.get("personas", [])
-        if not personas:
-            print("⚠️ Warning: No personas returned.")
-        else:
-            print(f"✅ Received {len(personas)} personas.")
-            p1 = personas[0]
-            print(f"   Persona 1: {p1['nickname']} ({p1['summary']})")
-            if 'journey' in p1:
-                eat_step = p1['journey'].get('eat', {})
-                print(f"   Journey Step (Eat): {eat_step.get('label')} -> {eat_step.get('opportunity')}")
-            else:
-                print("   ⚠️ Journey data missing logic error")
+        status_data = status_response.json()
+        if status_data["status"] == "completed":
+            break
+        if status_data["status"] == "failed":
+            pytest.fail(f"Analysis failed: {status_data['message']}")
 
-        print("\n🎉 E2E Test Passed Successfully!")
-        
-    except Exception as e:
-        print(f"❌ Result Retrieval Failed: {e}")
-        try: print(resp.text)
-        except: pass
-        sys.exit(1)
+        time.sleep(2)
+
+    result_response = requests.get(
+        f"{BASE_URL}/analysis/result/{task_id}",
+        timeout=10,
+    )
+    assert result_response.status_code == 200, result_response.text
+
+    result = result_response.json()
+    personas = result.get("personas", [])
+
+    assert personas, "Expected personas in the final result"
+    assert "journey" in personas[0], "Expected journey data in the first persona"
+
 
 if __name__ == "__main__":
-    main()
+    os.environ.setdefault("RUN_PULSE_E2E", "1")
+    raise SystemExit(pytest.main([__file__]))
