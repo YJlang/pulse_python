@@ -1,20 +1,23 @@
-from datetime import datetime, timedelta, timezone
-from typing import Dict
+import asyncio
+import threading
+import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas.dtos import (
     AnalysisRequestRequest,
-    TaskResponse,
-    TaskStatusResponse,
-    PersonaResponse,
-    ReviewSnapshotResponse,
     GenerateReviewRepliesRequest,
     GenerateReviewRepliesResponse,
+    PersonaResponse,
+    ReviewSnapshotResponse,
+    TaskResponse,
+    TaskStatusResponse,
 )
-from app.services.crawler_service import CrawlerService
 from app.services.analysis_service import AnalysisService
+from app.services.crawler_service import CrawlerService
 from app.services.llm_service import LLMService
 from app.services.mongo_service import MongoService
 from app.utils.logger import get_logger
@@ -22,7 +25,8 @@ from app.utils.logger import get_logger
 router = APIRouter()
 logger = get_logger(__name__)
 
-tasks: Dict[str, Dict] = {}
+tasks: Dict[str, Dict[str, Any]] = {}
+task_lock = threading.Lock()
 
 crawler_service = CrawlerService()
 analysis_service = AnalysisService()
@@ -30,17 +34,50 @@ llm_service = LLMService()
 mongo_service = MongoService()
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
+
     try:
         normalized = value.replace("Z", "+00:00")
         parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _create_task(task_id: str) -> None:
+    with task_lock:
+        tasks[task_id] = {
+            "status": "pending",
+            "message": "분석 대기 중입니다.",
+            "progress": 0,
+            "result": None,
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+        }
+
+
+def _update_task(task_id: str, **updates: Any) -> None:
+    with task_lock:
+        task = tasks.get(task_id)
+        if not task:
+            return
+        task.update(updates)
+        task["updated_at"] = _utc_now_iso()
+
+
+def _get_task(task_id: str) -> Dict[str, Any] | None:
+    with task_lock:
+        task = tasks.get(task_id)
+        return dict(task) if task else None
 
 
 async def _ensure_review_snapshot(
@@ -84,100 +121,100 @@ async def _ensure_review_snapshot(
     return snapshot
 
 
-async def _process_analysis_task(task_id: str, store_name: str, address: str):
+def _process_analysis_task(task_id: str, store_name: str, address: str) -> None:
     logger.info("Task %s started processing", task_id)
 
     try:
-        tasks[task_id].update(
-            {
-                "status": "processing",
-                "message": "리뷰 데이터를 수집하는 중입니다.",
-                "progress": 10,
-            }
+        _update_task(
+            task_id,
+            status="processing",
+            message="리뷰 데이터를 수집하는 중입니다.",
+            progress=10,
         )
 
-        reviews = await crawler_service.collect_all_reviews(store_name, address)
+        reviews = asyncio.run(crawler_service.collect_all_reviews(store_name, address))
         if not reviews:
-            tasks[task_id].update(
-                {
-                    "status": "failed",
-                    "message": "리뷰를 찾을 수 없습니다.",
-                    "progress": 0,
-                }
+            _update_task(
+                task_id,
+                status="failed",
+                message="리뷰를 찾을 수 없습니다.",
+                progress=0,
             )
             return
 
         mongo_service.initialize()
         mongo_service.save_raw_reviews(task_id, store_name, address, reviews)
 
-        tasks[task_id].update(
-            {
-                "status": "processing",
-                "message": "리뷰 토픽을 분석하는 중입니다.",
-                "progress": 40,
-            }
+        _update_task(
+            task_id,
+            status="processing",
+            message="리뷰 토픽을 분석하는 중입니다.",
+            progress=40,
         )
 
         analysis_result = analysis_service.run_analysis(reviews)
         if "error" in analysis_result:
-            tasks[task_id].update(
-                {
-                    "status": "failed",
-                    "message": f"분석 실패: {analysis_result['error']}",
-                    "progress": 0,
-                }
+            _update_task(
+                task_id,
+                status="failed",
+                message=f"분석 실패: {analysis_result['error']}",
+                progress=0,
             )
             return
 
-        tasks[task_id].update(
-            {
-                "status": "processing",
-                "message": "페르소나와 고객 여정을 생성하는 중입니다.",
-                "progress": 70,
-            }
+        _update_task(
+            task_id,
+            status="processing",
+            message="페르소나와 고객 여정을 생성하는 중입니다.",
+            progress=70,
         )
 
         final_report = llm_service.generate_full_report(store_name, analysis_result)
         mongo_service.save_result(task_id, final_report)
 
-        tasks[task_id].update(
-            {
-                "status": "completed",
-                "message": "분석 완료",
-                "progress": 100,
-                "result": final_report,
-            }
+        _update_task(
+            task_id,
+            status="completed",
+            message="분석 완료",
+            progress=100,
+            result=final_report,
         )
         logger.info("Task %s completed successfully", task_id)
     except Exception as exc:
-        import traceback
-
         logger.error("Task %s failed: %s\n%s", task_id, exc, traceback.format_exc())
-        tasks[task_id].update(
-            {
-                "status": "failed",
-                "message": f"서버 내부 오류: {exc}",
-                "progress": 0,
-            }
+        _update_task(
+            task_id,
+            status="failed",
+            message=f"서버 내부 오류: {exc}",
+            progress=0,
         )
 
 
+def _start_analysis_worker(task_id: str, store_name: str, address: str) -> None:
+    worker = threading.Thread(
+        target=_process_analysis_task,
+        args=(task_id, store_name, address),
+        name=f"analysis-{task_id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+
+
 @router.post("/analysis/request", response_model=TaskResponse)
-async def request_analysis(req: AnalysisRequestRequest, background_tasks: BackgroundTasks):
+async def request_analysis(req: AnalysisRequestRequest):
     task_id = str(uuid.uuid4())
-    tasks[task_id] = {
-        "status": "pending",
-        "message": "작업 대기 중",
-        "progress": 0,
-        "result": None,
-    }
-    background_tasks.add_task(_process_analysis_task, task_id, req.shopInfo_name, req.shopInfo_address)
-    return TaskResponse(task_id=task_id, status="pending", message="분석 요청이 접수되었습니다.")
+    _create_task(task_id)
+    _start_analysis_worker(task_id, req.shopInfo_name, req.shopInfo_address)
+    return TaskResponse(
+        task_id=task_id,
+        status="pending",
+        message="분석 요청이 접수되었습니다.",
+    )
 
 
 @router.get("/analysis/status/{task_id}", response_model=TaskStatusResponse)
 async def get_task_status(task_id: str):
-    task = tasks.get(task_id)
+    task = _get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -192,7 +229,7 @@ async def get_task_status(task_id: str):
 
 @router.get("/analysis/result/{task_id}", response_model=PersonaResponse)
 async def get_task_result(task_id: str):
-    task = tasks.get(task_id)
+    task = _get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] != "completed":
@@ -223,7 +260,7 @@ async def get_latest_result():
 async def get_latest_reviews(
     store_name: str = Query(..., description="가게 이름"),
     address: str = Query(..., description="가게 주소"),
-    refresh_if_needed: bool = Query(False, description="부족하거나 오래된 스냅샷이면 재수집"),
+    refresh_if_needed: bool = Query(False, description="리뷰가 부족하거나 오래된 경우 새로 수집"),
     target_total_reviews: int = Query(0, description="원하는 최소 총 리뷰 수"),
 ):
     try:
