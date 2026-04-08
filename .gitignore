@@ -19,6 +19,10 @@ __pycache__/
 output/
 *.csv
 *.json
+!app/assets/
+!app/assets/promotion/
+!app/assets/promotion/templates.json
+!app/assets/promotion/reference_blueprints.json
 
 # 디버그 파일
 *.log

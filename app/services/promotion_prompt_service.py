@@ -92,9 +92,13 @@ class DSPyPromotionOptimizer:
         model_name: str,
         reference_blueprints: list[dict[str, Any]],
     ) -> None:
+        optimizer_path = assets_dir / "veo_optimizer.json"
+        has_reference_data = bool(reference_blueprints)
+        has_precompiled_optimizer = optimizer_path.exists()
         self.enabled = (
             dspy is not None
             and bool(api_key)
+            and (has_reference_data or has_precompiled_optimizer)
             and os.getenv("PROMOTION_DSPY_ENABLED", "true").lower() not in {"0", "false", "off"}
         )
         self.model_name = model_name
@@ -107,6 +111,10 @@ class DSPyPromotionOptimizer:
                 logger.info("[PromotionPromptService] DSPy is unavailable. Falling back to direct prompting.")
             elif not api_key:
                 logger.info("[PromotionPromptService] DSPy is disabled because GEMINI_API_KEY is missing.")
+            elif not has_reference_data and not has_precompiled_optimizer:
+                logger.info(
+                    "[PromotionPromptService] DSPy is disabled because no optimizer assets are available."
+                )
             return
 
         try:
@@ -115,7 +123,6 @@ class DSPyPromotionOptimizer:
             self.module = DSPyPromotionPromptModule()
             self.trainset = self._build_trainset(reference_blueprints)
 
-            optimizer_path = assets_dir / "veo_optimizer.json"
             if optimizer_path.exists():
                 try:
                     self.module.load(str(optimizer_path))

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+from google.auth.exceptions import DefaultCredentialsError
 from google import genai
 from google.genai import types
 
@@ -19,6 +20,9 @@ load_dotenv(BASE_DIR / ".env.local", override=False)
 logger = get_logger(__name__)
 
 
+FALSEY_ENV_VALUES = {"0", "false", "off", "no"}
+
+
 class PromotionVideoService:
     def __init__(self) -> None:
         self.output_root = BASE_DIR / "output" / "promotion"
@@ -30,22 +34,41 @@ class PromotionVideoService:
         self.prompt_service = PromotionPromptService()
         self.project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         self.location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.gemini_api_key = (
-            os.getenv("VEO_API_KEY")
-            or os.getenv("GEMINI_API_KEY")
-            or os.getenv("VERTEX_VIDEO_API_KEY")
+        self.veo_api_key = os.getenv("VEO_API_KEY")
+        self.gemini_api_key = self.veo_api_key or os.getenv("GEMINI_API_KEY")
+        self.vertex_api_key = os.getenv("VERTEX_VIDEO_API_KEY")
+        self.vertex_output_gcs_uri = os.getenv("PROMOTION_VEO_OUTPUT_GCS_URI", "").strip()
+        self.provider = (os.getenv("PROMOTION_VEO_PROVIDER") or "").strip().lower()
+        if not self.provider:
+            self.provider = "vertex" if self.project_id else "gemini"
+        self.enable_secondary_backend_fallback = (
+            os.getenv("PROMOTION_VEO_ENABLE_SECONDARY_BACKEND_FALLBACK", "false").strip().lower()
+            not in FALSEY_ENV_VALUES
         )
 
-        # Official Gemini API docs currently document Veo 3.1 preview IDs.
+        # Gemini API defaults.
         self.standard_model = os.getenv("PROMOTION_VEO_STANDARD_MODEL", "veo-3.1-generate-preview")
         self.pro_model = os.getenv("PROMOTION_VEO_PRO_MODEL", self.standard_model)
         self.fast_model = os.getenv("PROMOTION_VEO_FAST_MODEL", "veo-3.1-fast-generate-preview")
         self.fallback_model = os.getenv("PROMOTION_VEO_FALLBACK_MODEL", "")
 
+        # Vertex defaults favor the more stable Veo 2 line.
+        self.vertex_standard_model = os.getenv("PROMOTION_VEO_VERTEX_STANDARD_MODEL", "veo-2.0-generate-001")
+        self.vertex_pro_model = os.getenv("PROMOTION_VEO_VERTEX_PRO_MODEL", self.vertex_standard_model)
+        self.vertex_fast_model = os.getenv("PROMOTION_VEO_VERTEX_FAST_MODEL", self.vertex_standard_model)
+        self.vertex_fallback_model = os.getenv("PROMOTION_VEO_VERTEX_FALLBACK_MODEL", "")
+
         self.standard_resolution = os.getenv("PROMOTION_VEO_STANDARD_RESOLUTION", "1080p")
         self.pro_resolution = os.getenv("PROMOTION_VEO_PRO_RESOLUTION", "4k")
         self.fast_resolution = os.getenv("PROMOTION_VEO_FAST_RESOLUTION", "720p")
         self.fallback_resolution = os.getenv("PROMOTION_VEO_FALLBACK_RESOLUTION", "720p")
+        self.vertex_standard_resolution = os.getenv("PROMOTION_VEO_VERTEX_STANDARD_RESOLUTION", "720p")
+        self.vertex_pro_resolution = os.getenv("PROMOTION_VEO_VERTEX_PRO_RESOLUTION", self.vertex_standard_resolution)
+        self.vertex_fast_resolution = os.getenv("PROMOTION_VEO_VERTEX_FAST_RESOLUTION", self.vertex_standard_resolution)
+        self.vertex_fallback_resolution = os.getenv(
+            "PROMOTION_VEO_VERTEX_FALLBACK_RESOLUTION",
+            self.vertex_standard_resolution,
+        )
 
     @staticmethod
     def _guess_mime_type(filename: str | None) -> str:
@@ -107,45 +130,71 @@ class PromotionVideoService:
         ]
 
     def _client_builders(self) -> list[tuple[str, Callable[[], genai.Client]]]:
+        available_builders: dict[str, Callable[[], genai.Client]] = {}
         if self.gemini_api_key:
-            return [("gemini-api", lambda: genai.Client(api_key=self.gemini_api_key))]
-
-        builders: list[tuple[str, Callable[[], genai.Client]]] = []
+            available_builders["gemini-api"] = lambda: genai.Client(api_key=self.gemini_api_key)
         if self.project_id:
-            builders.append(
-                (
-                    "vertex-adc",
-                    lambda: genai.Client(
-                        vertexai=True,
-                        project=self.project_id,
-                        location=self.location,
-                        http_options=types.HttpOptions(api_version="v1"),
-                    ),
-                )
+            available_builders["vertex-adc"] = lambda: genai.Client(
+                vertexai=True,
+                project=self.project_id,
+                location=self.location,
+                http_options=types.HttpOptions(api_version="v1"),
             )
-        return builders
 
-    def _mode_profiles(self, mode: str) -> list[dict[str, str]]:
+        if not available_builders:
+            return []
+
+        if self.provider == "gemini":
+            priority = ["gemini-api", "vertex-adc"]
+        else:
+            priority = ["vertex-adc", "gemini-api"]
+
+        ordered_names = [name for name in priority if name in available_builders]
+        if self.enable_secondary_backend_fallback:
+            return [(name, available_builders[name]) for name in ordered_names]
+
+        return [(ordered_names[0], available_builders[ordered_names[0]])]
+
+    def _mode_profiles(self, mode: str, *, client_name: str) -> list[dict[str, str]]:
         normalized_mode = (mode or "").strip().lower()
+        if client_name.startswith("vertex"):
+            standard_model = self.vertex_standard_model
+            pro_model = self.vertex_pro_model
+            fast_model = self.vertex_fast_model
+            fallback_model = self.vertex_fallback_model
+            standard_resolution = self.vertex_standard_resolution
+            pro_resolution = self.vertex_pro_resolution
+            fast_resolution = self.vertex_fast_resolution
+            fallback_resolution = self.vertex_fallback_resolution
+        else:
+            standard_model = self.standard_model
+            pro_model = self.pro_model
+            fast_model = self.fast_model
+            fallback_model = self.fallback_model
+            standard_resolution = self.standard_resolution
+            pro_resolution = self.pro_resolution
+            fast_resolution = self.fast_resolution
+            fallback_resolution = self.fallback_resolution
+
         if normalized_mode == "pro":
             profiles = [
-                {"name": "pro", "model": self.pro_model, "resolution": self.pro_resolution},
-                {"name": "standard", "model": self.standard_model, "resolution": self.standard_resolution},
+                {"name": "pro", "model": pro_model, "resolution": pro_resolution},
+                {"name": "standard", "model": standard_model, "resolution": standard_resolution},
             ]
         elif normalized_mode == "standard_fast":
             profiles = [
-                {"name": "fast", "model": self.fast_model, "resolution": self.fast_resolution},
-                {"name": "standard", "model": self.standard_model, "resolution": self.standard_resolution},
+                {"name": "fast", "model": fast_model, "resolution": fast_resolution},
+                {"name": "standard", "model": standard_model, "resolution": standard_resolution},
             ]
         else:
             profiles = [
-                {"name": "standard", "model": self.standard_model, "resolution": self.standard_resolution},
-                {"name": "fast", "model": self.fast_model, "resolution": self.fast_resolution},
+                {"name": "standard", "model": standard_model, "resolution": standard_resolution},
+                {"name": "fast", "model": fast_model, "resolution": fast_resolution},
             ]
 
-        if self.fallback_model:
+        if fallback_model:
             profiles.append(
-                {"name": "fallback", "model": self.fallback_model, "resolution": self.fallback_resolution}
+                {"name": "fallback", "model": fallback_model, "resolution": fallback_resolution}
             )
 
         deduped: list[dict[str, str]] = []
@@ -163,6 +212,78 @@ class PromotionVideoService:
         if resolution.lower() in {"1080p", "4k"} or reference_images:
             return 8
         return 6
+
+    def _build_video_config(
+        self,
+        *,
+        client_name: str,
+        profile: dict[str, str],
+        plan: dict[str, Any],
+        reference_images: list[types.VideoGenerationReferenceImage] | None,
+        duration_seconds: int,
+    ) -> types.GenerateVideosConfig:
+        config_kwargs: dict[str, Any] = {
+            "aspect_ratio": (plan.get("metadata") or {}).get("aspect_ratio", "9:16"),
+            "duration_seconds": duration_seconds,
+            "resolution": profile["resolution"],
+            "negative_prompt": ", ".join(plan.get("negative_prompts") or []),
+        }
+
+        if reference_images:
+            config_kwargs["reference_images"] = reference_images
+
+        if client_name.startswith("vertex") and self.vertex_output_gcs_uri:
+            config_kwargs["output_gcs_uri"] = self.vertex_output_gcs_uri
+
+        return types.GenerateVideosConfig(**config_kwargs)
+
+    def _normalize_generation_error(self, errors: list[Exception]) -> RuntimeError:
+        if not errors:
+            return RuntimeError(
+                "Video generation could not be completed. "
+                "No usable Gemini or Vertex authentication method was found."
+            )
+
+        error = errors[-1]
+        message = str(error)
+        combined_message = " | ".join(str(item) for item in errors)
+
+        if (
+            any("RESOURCE_EXHAUSTED" in str(item) or "Quota exceeded" in str(item) for item in errors)
+            and any(isinstance(item, DefaultCredentialsError) or "DefaultCredentialsError" in str(item) for item in errors)
+        ):
+            return RuntimeError(
+                "The configured Gemini API key is out of quota, and the fallback Vertex AI path is not authenticated "
+                "on this machine. Enable billing for the Gemini key or set up Vertex AI ADC credentials."
+            )
+
+        if isinstance(error, DefaultCredentialsError) or "DefaultCredentialsError" in message:
+            return RuntimeError(
+                "Vertex AI authentication is not configured on this machine. "
+                "Set up Application Default Credentials (ADC) for the configured Google Cloud project "
+                "before using Veo through Vertex AI. "
+                "This backend does not rely on VERTEX_VIDEO_API_KEY alone."
+            )
+
+        if "RESOURCE_PROJECT_INVALID" in message:
+            return RuntimeError(
+                "The provided Vertex video key could not be mapped to a usable Google Cloud project for Veo. "
+                "Use standard Vertex AI project authentication (ADC/service account) with "
+                "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION for video generation."
+            )
+
+        if "RESOURCE_EXHAUSTED" in message or "Quota exceeded" in message:
+            if "free_tier" in message or "FreeTier" in message:
+                return RuntimeError(
+                    "The configured Gemini API key has exhausted its free-tier quota. "
+                    "Enable paid billing for that key or switch to Vertex AI with project credentials."
+                )
+            return RuntimeError(
+                "Google rejected the Veo request because the configured account or project is out of quota "
+                "or billing capacity."
+            )
+
+        return RuntimeError(f"Video generation could not be completed. {combined_message}")
 
     def _persist_generated_video(self, client: genai.Client, video: types.Video) -> str:
         local_path = self.videos_dir / f"{uuid.uuid4().hex}.mp4"
@@ -207,10 +328,28 @@ class PromotionVideoService:
         reference_images = self._build_reference_images(image_path)
         optimizer_name = (plan.get("metadata") or {}).get("optimizer")
 
-        last_error: Exception | None = None
-        for client_name, build_client in self._client_builders():
-            client = build_client()
-            for profile in self._mode_profiles(mode):
+        client_builders = self._client_builders()
+        if not client_builders:
+            raise RuntimeError(
+                "No Veo authentication is configured. "
+                "Set VEO_API_KEY or GEMINI_API_KEY for the Gemini API, or configure "
+                "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION with Vertex AI ADC credentials."
+            )
+
+        attempt_errors: list[Exception] = []
+        for client_name, build_client in client_builders:
+            try:
+                client = build_client()
+            except Exception as exc:
+                attempt_errors.append(exc)
+                logger.warning(
+                    "[PromotionVideoService] Failed to initialize %s client: %s",
+                    client_name,
+                    exc,
+                )
+                continue
+
+            for profile in self._mode_profiles(mode, client_name=client_name):
                 try:
                     duration_seconds = self._duration_for_profile(
                         profile["resolution"],
@@ -227,12 +366,12 @@ class PromotionVideoService:
                     operation = client.models.generate_videos(
                         model=profile["model"],
                         prompt=prompt,
-                        config=types.GenerateVideosConfig(
-                            aspect_ratio=(plan.get("metadata") or {}).get("aspect_ratio", "9:16"),
-                            duration_seconds=duration_seconds,
-                            resolution=profile["resolution"],
+                        config=self._build_video_config(
+                            client_name=client_name,
+                            profile=profile,
+                            plan=plan,
                             reference_images=reference_images,
-                            negative_prompt=", ".join(plan.get("negative_prompts") or []),
+                            duration_seconds=duration_seconds,
                         ),
                     )
 
@@ -266,7 +405,7 @@ class PromotionVideoService:
                         "resolution": profile["resolution"],
                     }
                 except Exception as exc:
-                    last_error = exc
+                    attempt_errors.append(exc)
                     logger.warning(
                         "[PromotionVideoService] Video generation attempt via %s/%s failed: %s",
                         client_name,
@@ -274,7 +413,4 @@ class PromotionVideoService:
                         exc,
                     )
 
-        raise RuntimeError(
-            "Video generation could not be completed. "
-            f"{last_error or 'No usable Gemini or Vertex authentication method was found.'}"
-        )
+        raise self._normalize_generation_error(attempt_errors)
