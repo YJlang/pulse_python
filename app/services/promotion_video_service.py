@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 
 
 FALSEY_ENV_VALUES = {"0", "false", "off", "no"}
+VERTICAL_REEL_ASPECT_RATIO = "9:16"
 
 
 class PromotionVideoService:
@@ -38,6 +39,9 @@ class PromotionVideoService:
         self.gemini_api_key = self.veo_api_key or os.getenv("GEMINI_API_KEY")
         self.vertex_api_key = os.getenv("VERTEX_VIDEO_API_KEY")
         self.vertex_output_gcs_uri = os.getenv("PROMOTION_VEO_OUTPUT_GCS_URI", "").strip()
+        self.aspect_ratio = (os.getenv("PROMOTION_VEO_ASPECT_RATIO") or VERTICAL_REEL_ASPECT_RATIO).strip()
+        if not self.aspect_ratio:
+            self.aspect_ratio = VERTICAL_REEL_ASPECT_RATIO
         self.provider = (os.getenv("PROMOTION_VEO_PROVIDER") or "").strip().lower()
         if not self.provider:
             self.provider = "vertex" if self.project_id else "gemini"
@@ -52,10 +56,19 @@ class PromotionVideoService:
         self.fast_model = os.getenv("PROMOTION_VEO_FAST_MODEL", "veo-3.1-fast-generate-preview")
         self.fallback_model = os.getenv("PROMOTION_VEO_FALLBACK_MODEL", "")
 
-        # Vertex defaults favor the more stable Veo 2 line.
-        self.vertex_standard_model = os.getenv("PROMOTION_VEO_VERTEX_STANDARD_MODEL", "veo-2.0-generate-001")
-        self.vertex_pro_model = os.getenv("PROMOTION_VEO_VERTEX_PRO_MODEL", self.vertex_standard_model)
-        self.vertex_fast_model = os.getenv("PROMOTION_VEO_VERTEX_FAST_MODEL", self.vertex_standard_model)
+        # Vertex defaults use the GA Veo 3.1 line so image-based reels can stay vertical.
+        self.vertex_standard_model = os.getenv(
+            "PROMOTION_VEO_VERTEX_STANDARD_MODEL",
+            "veo-3.1-fast-generate-001",
+        )
+        self.vertex_pro_model = os.getenv(
+            "PROMOTION_VEO_VERTEX_PRO_MODEL",
+            "veo-3.1-generate-001",
+        )
+        self.vertex_fast_model = os.getenv(
+            "PROMOTION_VEO_VERTEX_FAST_MODEL",
+            "veo-3.1-fast-generate-001",
+        )
         self.vertex_fallback_model = os.getenv("PROMOTION_VEO_VERTEX_FALLBACK_MODEL", "")
 
         self.standard_resolution = os.getenv("PROMOTION_VEO_STANDARD_RESOLUTION", "1080p")
@@ -222,8 +235,17 @@ class PromotionVideoService:
         reference_images: list[types.VideoGenerationReferenceImage] | None,
         duration_seconds: int,
     ) -> types.GenerateVideosConfig:
+        requested_aspect_ratio = ((plan.get("metadata") or {}).get("aspect_ratio") or "").strip()
+        aspect_ratio = self.aspect_ratio
+        if requested_aspect_ratio and requested_aspect_ratio != aspect_ratio:
+            logger.info(
+                "[PromotionVideoService] Overriding prompt aspect ratio %s -> %s for mobile reels.",
+                requested_aspect_ratio,
+                aspect_ratio,
+            )
+
         config_kwargs: dict[str, Any] = {
-            "aspect_ratio": (plan.get("metadata") or {}).get("aspect_ratio", "9:16"),
+            "aspect_ratio": aspect_ratio,
             "duration_seconds": duration_seconds,
             "resolution": profile["resolution"],
             "negative_prompt": ", ".join(plan.get("negative_prompts") or []),
@@ -247,6 +269,12 @@ class PromotionVideoService:
         error = errors[-1]
         message = str(error)
         combined_message = " | ".join(str(item) for item in errors)
+        deprecated_vertex_preview_models = (
+            "veo-3.1-generate-preview",
+            "veo-3.1-fast-generate-preview",
+            "veo-3.0-generate-preview",
+            "veo-3.0-fast-generate-preview",
+        )
 
         if (
             any("RESOURCE_EXHAUSTED" in str(item) or "Quota exceeded" in str(item) for item in errors)
@@ -272,6 +300,20 @@ class PromotionVideoService:
                 "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION for video generation."
             )
 
+        if any(model in combined_message for model in deprecated_vertex_preview_models) and (
+            "NOT_FOUND" in combined_message or "404" in combined_message
+        ):
+            return RuntimeError(
+                "The configured Vertex Veo preview model is no longer available. "
+                "Use the GA model IDs veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+            )
+
+        if "Unsupported output video aspect ratio" in combined_message:
+            return RuntimeError(
+                "The configured Veo model does not support fixed 9:16 output for this request. "
+                "Use a Veo 3.x model that supports vertical reference-image generation."
+            )
+
         if "RESOURCE_EXHAUSTED" in message or "Quota exceeded" in message:
             if "free_tier" in message or "FreeTier" in message:
                 return RuntimeError(
@@ -287,6 +329,13 @@ class PromotionVideoService:
 
     def _persist_generated_video(self, client: genai.Client, video: types.Video) -> str:
         local_path = self.videos_dir / f"{uuid.uuid4().hex}.mp4"
+
+        # Vertex responses can inline the generated MP4 bytes instead of exposing
+        # a downloadable file handle. Persist them directly when present.
+        video_bytes = getattr(video, "video_bytes", None)
+        if video_bytes:
+            local_path.write_bytes(bytes(video_bytes))
+            return f"/static/promotion/videos/{local_path.name}"
 
         try:
             client.files.download(file=video)
