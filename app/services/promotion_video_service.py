@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 
 FALSEY_ENV_VALUES = {"0", "false", "off", "no"}
 VERTICAL_REEL_ASPECT_RATIO = "9:16"
+TRUEY_ENV_VALUES = {"1", "true", "on", "yes"}
 
 
 class PromotionVideoService:
@@ -42,6 +43,10 @@ class PromotionVideoService:
         self.aspect_ratio = (os.getenv("PROMOTION_VEO_ASPECT_RATIO") or VERTICAL_REEL_ASPECT_RATIO).strip()
         if not self.aspect_ratio:
             self.aspect_ratio = VERTICAL_REEL_ASPECT_RATIO
+        self.allow_vertical_reference_images = (
+            os.getenv("PROMOTION_VEO_ALLOW_VERTICAL_REFERENCE_IMAGES", "false").strip().lower()
+            in TRUEY_ENV_VALUES
+        )
         self.provider = (os.getenv("PROMOTION_VEO_PROVIDER") or "").strip().lower()
         if not self.provider:
             self.provider = "vertex" if self.project_id else "gemini"
@@ -141,6 +146,25 @@ class PromotionVideoService:
                 referenceType=types.VideoGenerationReferenceType.ASSET,
             )
         ]
+
+    def _reference_images_for_generation(
+        self,
+        reference_images: list[types.VideoGenerationReferenceImage] | None,
+    ) -> list[types.VideoGenerationReferenceImage] | None:
+        if not reference_images:
+            return None
+
+        if self.aspect_ratio == VERTICAL_REEL_ASPECT_RATIO and not self.allow_vertical_reference_images:
+            logger.info(
+                "[PromotionVideoService] Uploaded image was used for prompt analysis, but was not sent "
+                "as a Veo reference image because reference-image generation does not reliably support "
+                "%s output. Set PROMOTION_VEO_ALLOW_VERTICAL_REFERENCE_IMAGES=true only after the "
+                "configured backend supports it.",
+                VERTICAL_REEL_ASPECT_RATIO,
+            )
+            return None
+
+        return reference_images
 
     def _client_builders(self) -> list[tuple[str, Callable[[], genai.Client]]]:
         available_builders: dict[str, Callable[[], genai.Client]] = {}
@@ -310,8 +334,10 @@ class PromotionVideoService:
 
         if "Unsupported output video aspect ratio" in combined_message:
             return RuntimeError(
-                "The configured Veo model does not support fixed 9:16 output for this request. "
-                "Use a Veo 3.x model that supports vertical reference-image generation."
+                "The configured Veo backend rejected this image-to-video request because the requested "
+                "output aspect ratio is not supported with reference images. For vertical reels, use the "
+                "uploaded image for prompt analysis but do not send it as a Veo reference image, or switch "
+                "the output aspect ratio to a supported format."
             )
 
         if "RESOURCE_EXHAUSTED" in message or "Quota exceeded" in message:
@@ -374,7 +400,8 @@ class PromotionVideoService:
             image_path=image_path,
         )
         prompt = self._build_prompt_text(plan)
-        reference_images = self._build_reference_images(image_path)
+        uploaded_reference_images = self._build_reference_images(image_path)
+        reference_images = self._reference_images_for_generation(uploaded_reference_images)
         optimizer_name = (plan.get("metadata") or {}).get("optimizer")
 
         client_builders = self._client_builders()

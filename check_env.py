@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import importlib.util
+import re
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -20,6 +21,9 @@ def get_installed_version(package_name):
         return "Not found"
     except:
         return "Error"
+
+def normalize_requirement_name(requirement):
+    return re.split(r'[<>=!~]', requirement, 1)[0].strip()
 
 def check_cuda():
     try:
@@ -44,7 +48,11 @@ print("\n---- Dependency Check ----")
 req_file = "requirements.txt"
 try:
     with open(req_file, 'r') as f:
-        requirements = [line.strip().split('==')[0] for line in f if line.strip() and not line.startswith('#')]
+        requirements = [
+            normalize_requirement_name(line.strip())
+            for line in f
+            if line.strip() and not line.startswith('#')
+        ]
     
     package_mappings = {
         "python-dotenv": "dotenv",
