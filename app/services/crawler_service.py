@@ -4,6 +4,7 @@ Naver and Kakao review crawling service.
 
 import asyncio
 import hashlib
+import json
 import re
 import sys
 import threading
@@ -11,6 +12,7 @@ from datetime import datetime
 from typing import Dict, List
 from urllib.parse import quote
 
+import requests
 from playwright.async_api import Page, async_playwright
 
 from app.utils.logger import get_logger
@@ -19,13 +21,16 @@ logger = get_logger(__name__)
 
 
 class CrawlerService:
-    NAVER_REVIEW_CARD_SELECTOR = "li.place_apply_pui.EjjAW"
-    NAVER_DETAIL_LINK_SELECTOR = 'a[href*="/restaurant/"], a[href*="/place/"]'
-    NAVER_EXPAND_TEXT_SELECTORS = (
-        "a.pui__wFzIYl",
-        "a.fvwqf",
-        "a.Kv9y6",
+    # 네이버 방문자 리뷰: 헤드리스 브라우저는 봇으로 탐지·차단되므로(동일 IP라도 1회차 차단),
+    # 모바일 플레이스 내부 HTTP API(검색 + GraphQL)를 직접 호출한다. 카카오는 기존 브라우저 방식 유지.
+    NAVER_MOBILE_UA = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
     )
+    NAVER_PCMAP_LIST_URL = "https://pcmap.place.naver.com/restaurant/list"
+    NAVER_GRAPHQL_URL = "https://api.place.naver.com/graphql"
+    # getVisitorReviews 는 size 상한 50, page 파라미터 무시 → 한 가게당 최신 50개가 수집 한계.
+    NAVER_REVIEW_MAX_PAGE_SIZE = 50
 
     @staticmethod
     def _normalize_search_text(text: str) -> str:
@@ -230,127 +235,6 @@ class CrawlerService:
 
         return sorted(reviews, key=sort_key, reverse=True)
 
-    async def _extract_naver_reviews_from_dom(self, page: Page) -> List[Dict]:
-        raw_reviews = await page.evaluate(
-            f"""
-            () => Array.from(document.querySelectorAll('{self.NAVER_REVIEW_CARD_SELECTOR}')).map((card) => {{
-              const author =
-                card.querySelector('.pui__JiVbY3')?.innerText?.trim() ||
-                card.querySelector('.pui__uslU0d')?.innerText?.trim() ||
-                '';
-
-              const text =
-                card.querySelector('.pui__vn15t2 > a')?.innerText?.trim() ||
-                card.querySelector('.pui__vn15t2')?.innerText?.trim() ||
-                '';
-
-              const dateText =
-                card.querySelector('.pui__QKE5Pr')?.innerText?.trim() ||
-                card.querySelector('.pui__gfuUIT')?.innerText?.trim() ||
-                '';
-
-              return {{
-                rawText: card.innerText || '',
-                author,
-                text,
-                dateText,
-                hasPhoto: card.innerText.includes('사진') || card.querySelectorAll('img').length > 0,
-              }};
-            }});
-            """
-        )
-
-        reviews: List[Dict] = []
-        for raw_review in raw_reviews:
-            text = self._clean_review_text(raw_review.get("text") or "")
-            if len(text) < 2:
-                continue
-
-            author = (raw_review.get("author") or "").strip() or "네이버 리뷰어"
-            date = self._normalize_review_date(raw_review.get("dateText"))
-            raw_text = raw_review.get("rawText") or text
-            review_id = self._build_review_id("naver", text, date, author)
-            reviews.append(
-                {
-                    "id": review_id,
-                    "raw_text": raw_text,
-                    "text": text,
-                    "rating": None,
-                    "date": date,
-                    "source": "naver",
-                    "source_label": self._build_source_label("naver"),
-                    "author": author,
-                    "has_photo": bool(raw_review.get("hasPhoto")),
-                }
-            )
-
-        return reviews
-
-    async def _click_visible_elements(self, page: Page, selector: str, max_clicks: int = 20) -> int:
-        locator = page.locator(selector)
-        click_count = 0
-        total = await locator.count()
-
-        for index in range(min(total, max_clicks)):
-            element = locator.nth(index)
-            try:
-                if not await element.is_visible():
-                    continue
-                await element.click(timeout=600)
-                click_count += 1
-                await page.wait_for_timeout(100)
-            except Exception:
-                continue
-
-        return click_count
-
-    async def _extract_naver_search_candidates(self, page: Page) -> List[Dict[str, str]]:
-        return await page.evaluate(
-            """
-            () => {
-              const candidates = [];
-              const seen = new Set();
-              const links = Array.from(
-                document.querySelectorAll('a[href*="/restaurant/"], a[href*="/place/"]')
-              );
-
-              for (const link of links) {
-                const href = link.getAttribute('href') || '';
-                if (!/^\\/(restaurant|place)\\/\\d+(?:\\?.*)?$/.test(href)) {
-                  continue;
-                }
-
-                const absoluteHref = href.startsWith('http')
-                  ? href
-                  : `https://m.place.naver.com${href}`;
-                const dedupeKey = absoluteHref.split('?')[0];
-                if (seen.has(dedupeKey)) {
-                  continue;
-                }
-
-                seen.add(dedupeKey);
-                const container =
-                  link.closest('li') ||
-                  link.closest('article') ||
-                  link.parentElement;
-
-                candidates.push({
-                  href: absoluteHref,
-                  title: (link.innerText || '').trim(),
-                  address: '',
-                  context: (container?.innerText || '').trim(),
-                });
-
-                if (candidates.length >= 10) {
-                  break;
-                }
-              }
-
-              return candidates;
-            }
-            """
-        )
-
     async def _extract_kakao_search_candidates(self, page: Page) -> List[Dict[str, str]]:
         return await page.evaluate(
             """
@@ -369,99 +253,268 @@ class CrawlerService:
             """
         )
 
-    async def _resolve_naver_detail_url(self, page: Page, store_name: str, address: str) -> str | None:
-        path = page.url.split("?", 1)[0]
-        if re.search(r"/(?:restaurant|place)/\d+$", path):
-            return page.url
+    def _normalize_naver_review_date(self, date_text: str | None) -> str | None:
+        """네이버 방문자 리뷰 API의 상대 날짜 표기를 YYYY-MM-DD로 변환.
 
-        candidates = await self._extract_naver_search_candidates(page)
-        best_candidate = self._select_best_candidate(candidates, store_name, address)
-        if best_candidate:
-            logger.info(
-                "[Naver] Selected candidate: %s (score=%s)",
-                best_candidate.get("title") or best_candidate.get("href"),
-                best_candidate.get("match_score", 0),
+        관측된 형식:
+          - 'M.D.요일'      (올해 작성분, 연도 생략)        예) '6.7.일'
+          - 'YY.M.D.요일'   (작년 이전, 2자리 연도)         예) '25.6.11.수'
+        그 외 형식은 기존 _normalize_review_date 로 폴백한다.
+        """
+        if not date_text:
+            return None
+
+        nums = []
+        for token in str(date_text).split("."):
+            digits = re.sub(r"[^0-9]", "", token)
+            if digits:
+                nums.append(int(digits))
+
+        today = datetime.now()
+        if len(nums) >= 3:
+            year = 2000 + nums[0] if nums[0] < 100 else nums[0]
+            month, day = nums[1], nums[2]
+        elif len(nums) == 2:
+            month, day, year = nums[0], nums[1], today.year
+        else:
+            # 예상 밖 형식은 기존 절대표기 파서로 시도
+            return self._normalize_review_date(date_text)
+
+        try:
+            parsed = datetime(year, month, day)
+        except ValueError:
+            return None
+
+        # 연도를 생략한(올해로 가정한) 리뷰가 미래로 계산되면 작년으로 보정
+        # (예: 1월에 조회한 12월 리뷰)
+        if len(nums) == 2 and parsed.date() > today.date():
+            try:
+                parsed = datetime(year - 1, month, day)
+            except ValueError:
+                return None
+
+        return parsed.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _extract_apollo_state(html: str) -> dict | None:
+        """SSR HTML 에 임베드된 window.__APOLLO_STATE__ JSON 을 추출한다."""
+        match = re.search(
+            r"window\.__APOLLO_STATE__\s*=\s*(\{.*?\})\s*;?\s*</script>", html, re.DOTALL
+        )
+        if not match:
+            match = re.search(r"__APOLLO_STATE__\s*=\s*(\{.*\});", html, re.DOTALL)
+        if not match:
+            return None
+
+        raw = match.group(1)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # 뒤에 다른 스크립트가 붙은 경우 가장 바깥 균형 중괄호까지만 잘라 재시도
+            depth = 0
+            end = 0
+            for index, char in enumerate(raw):
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        break
+            if not end:
+                return None
+            try:
+                return json.loads(raw[:end])
+            except json.JSONDecodeError:
+                return None
+
+    def _resolve_naver_business_id(self, store_name: str, address: str) -> str | None:
+        """pcmap 검색 결과(SSR)에서 가게 후보를 추출하고 점수 매칭으로 businessId 를 고른다."""
+        query = self._build_search_query(store_name, address)
+        try:
+            response = requests.get(
+                self.NAVER_PCMAP_LIST_URL,
+                params={"query": query},
+                headers={
+                    "User-Agent": self.NAVER_MOBILE_UA,
+                    "Referer": "https://pcmap.place.naver.com/",
+                },
+                timeout=15,
             )
-            return best_candidate.get("href")
+        except requests.RequestException as exc:
+            logger.error("[Naver] 검색 요청 실패: %s", exc)
+            return None
 
-        return None
+        if response.status_code != 200:
+            logger.warning("[Naver] 검색 응답 비정상 status=%s", response.status_code)
+            return None
+
+        apollo = self._extract_apollo_state(response.text)
+        if not apollo:
+            logger.warning("[Naver] 검색 결과 APOLLO_STATE 파싱 실패 (query=%s)", query)
+            return None
+
+        candidates: List[Dict[str, str]] = []
+        for value in apollo.values():
+            if not isinstance(value, dict):
+                continue
+            if value.get("__typename") != "PlaceListBusinessesItem":
+                continue
+            business_id = value.get("id")
+            name = value.get("name")
+            if not (business_id and str(business_id).isdigit() and name):
+                continue
+            addr = (
+                value.get("roadAddress")
+                or value.get("commonAddress")
+                or value.get("address")
+                or ""
+            )
+            candidates.append(
+                {
+                    "data_id": str(business_id),
+                    "title": name,
+                    "address": addr,
+                    "context": f"{name} {addr}".strip(),
+                }
+            )
+
+        if not candidates:
+            logger.warning("[Naver] 검색 후보 없음 (query=%s)", query)
+            return None
+
+        best = self._select_best_candidate(candidates, store_name, address)
+        if not best:
+            return None
+
+        logger.info(
+            "[Naver] Selected candidate: %s (id=%s, score=%s)",
+            best.get("title"),
+            best.get("data_id"),
+            best.get("match_score", 0),
+        )
+        return best.get("data_id")
+
+    def _fetch_naver_visitor_reviews(self, business_id: str, max_reviews: int) -> List[Dict]:
+        """getVisitorReviews GraphQL 로 방문자 리뷰 원본 item 목록을 받는다(최신 최대 50개)."""
+        size = max(1, min(max_reviews, self.NAVER_REVIEW_MAX_PAGE_SIZE))
+        gql_query = (
+            "query getVisitorReviews($input: VisitorReviewsInput) {"
+            " visitorReviews(input: $input) {"
+            " total"
+            " items { id rating author { nickname } body created visited"
+            " media { type } originType }"
+            " } }"
+        )
+        payload = [
+            {
+                "operationName": "getVisitorReviews",
+                "variables": {
+                    "input": {
+                        "businessId": str(business_id),
+                        "businessType": "restaurant",
+                        "item": "0",
+                        "page": 1,
+                        "size": size,
+                        "isPhotoUsed": False,
+                        "includeContent": True,
+                        "cidList": [],
+                    }
+                },
+                "query": gql_query,
+            }
+        ]
+        try:
+            response = requests.post(
+                self.NAVER_GRAPHQL_URL,
+                json=payload,
+                headers={
+                    "User-Agent": self.NAVER_MOBILE_UA,
+                    "Content-Type": "application/json",
+                    "Referer": f"https://m.place.naver.com/restaurant/{business_id}/review/visitor",
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            logger.error("[Naver] 리뷰 API 요청 실패: %s", exc)
+            return []
+
+        if response.status_code != 200:
+            logger.warning("[Naver] 리뷰 API 응답 비정상 status=%s", response.status_code)
+            return []
+
+        try:
+            node = response.json()
+            node = node[0] if isinstance(node, list) else node
+        except (ValueError, IndexError) as exc:
+            logger.error("[Naver] 리뷰 API JSON 파싱 실패: %s", exc)
+            return []
+
+        if isinstance(node, dict) and node.get("errors"):
+            logger.warning(
+                "[Naver] 리뷰 API GraphQL 오류: %s",
+                str(node["errors"][0].get("message", ""))[:200],
+            )
+            return []
+
+        visitor_reviews = ((node or {}).get("data") or {}).get("visitorReviews") or {}
+        return visitor_reviews.get("items") or []
+
+    def _collect_naver_reviews(self, store_name: str, address: str, max_reviews: int) -> List[Dict]:
+        """동기 컨텍스트에서 네이버 리뷰를 수집해 기존과 '동일한 형식'의 dict 리스트로 변환한다."""
+        business_id = self._resolve_naver_business_id(store_name, address)
+        if not business_id:
+            return []
+
+        items = self._fetch_naver_visitor_reviews(business_id, max_reviews)
+
+        reviews: List[Dict] = []
+        seen_ids = set()
+        for item in items:
+            raw_text = item.get("body") or ""
+            text = self._clean_review_text(raw_text)
+            if len(text) < 2:
+                continue
+
+            author = ((item.get("author") or {}).get("nickname") or "").strip() or "네이버 리뷰어"
+            date = self._normalize_naver_review_date(item.get("created"))
+            review_id = self._build_review_id("naver", text, date, author)
+            if review_id in seen_ids:
+                continue
+            seen_ids.add(review_id)
+
+            reviews.append(
+                {
+                    "id": review_id,
+                    "raw_text": raw_text,
+                    "text": text,
+                    "rating": None,
+                    "date": date,
+                    "source": "naver",
+                    "source_label": self._build_source_label("naver"),
+                    "author": author,
+                    "has_photo": bool(item.get("media")),
+                }
+            )
+            if len(reviews) >= max_reviews:
+                break
+
+        reviews = self._sort_reviews_by_latest(reviews)
+        logger.info("[Naver] Collected %s reviews (API)", len(reviews))
+        return reviews
 
     async def crawl_naver(self, store_name: str, address: str, max_reviews: int = 80) -> List[Dict]:
         query = self._build_search_query(store_name, address)
         logger.info("[Naver] Searching for: %s", query)
-        reviews: List[Dict] = []
-        seen_ids = set()
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-                viewport={"width": 375, "height": 812},
+        try:
+            loop = asyncio.get_running_loop()
+            # requests(동기)를 별도 스레드에서 실행해 카카오 크롤링과의 동시성을 유지한다.
+            reviews = await loop.run_in_executor(
+                None, self._collect_naver_reviews, store_name, address, max_reviews
             )
-            page = await context.new_page()
-
-            try:
-                search_url = f"https://m.place.naver.com/restaurant/list?query={quote(query)}"
-                await page.goto(search_url, wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(2500)
-
-                body_text = await page.locator("body").inner_text(timeout=5000)
-                if "서비스 이용이 제한" in body_text or "과도한 접근 요청" in body_text:
-                    logger.warning(
-                        "[Naver] Access restricted by Naver Place while searching '%s': %s",
-                        query,
-                        re.sub(r"\s+", " ", body_text).strip()[:220],
-                    )
-                    return []
-
-                detail_url = await self._resolve_naver_detail_url(page, store_name, address)
-                if not detail_url:
-                    logger.warning("[Naver] No detail page found from search results.")
-                    return []
-
-                await page.goto(detail_url, wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(1200)
-
-                place_match = re.search(r"/(?:restaurant|place)/(\d+)", page.url)
-                if not place_match:
-                    logger.warning("[Naver] Failed to resolve place id from %s", page.url)
-                    return []
-
-                place_id = place_match.group(1)
-                review_url = f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple"
-                await page.goto(review_url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(4000)
-
-                stagnant_rounds = 0
-                max_rounds = 12
-
-                while len(reviews) < max_reviews and stagnant_rounds < max_rounds:
-                    before_count = len(reviews)
-
-                    for selector in self.NAVER_EXPAND_TEXT_SELECTORS:
-                        await self._click_visible_elements(page, selector)
-
-                    extracted_reviews = await self._extract_naver_reviews_from_dom(page)
-                    for review in extracted_reviews:
-                        if review["id"] in seen_ids:
-                            continue
-                        seen_ids.add(review["id"])
-                        reviews.append(review)
-
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(1800)
-
-                    if len(reviews) == before_count:
-                        stagnant_rounds += 1
-                    else:
-                        stagnant_rounds = 0
-
-                reviews = self._sort_reviews_by_latest(reviews)
-                logger.info("[Naver] Collected %s reviews", len(reviews))
-            except Exception as exc:
-                logger.error("[Naver] Crawling error: %s", exc)
-            finally:
-                await browser.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Naver] Crawling error: %s", exc)
+            return []
 
         return reviews[:max_reviews]
 
